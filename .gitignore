@@ -1,0 +1,15 @@
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+.venv/
+lambda.zip
+build/
+.env
+
+infra/.terraform/
+infra/terraform.tfstate
+infra/terraform.tfstate.backup
