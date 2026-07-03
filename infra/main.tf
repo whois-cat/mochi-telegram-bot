@@ -110,14 +110,16 @@ resource "aws_lambda_function" "app" {
     aws_iam_role_policy_attachment.lambda_basic_execution,
     aws_iam_role_policy.lambda_read_app_config_secret,
     aws_iam_role_policy.lambda_known_words_table,
+    aws_iam_role_policy.lambda_practice_sessions_table,
     aws_cloudwatch_log_group.lambda
   ]
 
   tags = local.common_tags
   environment {
     variables = {
-      APP_CONFIG_SECRET_ID   = aws_secretsmanager_secret.app_config.name
-      KNOWN_WORDS_TABLE_NAME = aws_dynamodb_table.known_words.name
+      APP_CONFIG_SECRET_ID         = aws_secretsmanager_secret.app_config.name
+      KNOWN_WORDS_TABLE_NAME       = aws_dynamodb_table.known_words.name
+      PRACTICE_SESSIONS_TABLE_NAME = aws_dynamodb_table.practice_sessions.name
     }
   }
 }
@@ -189,9 +191,54 @@ resource "aws_iam_role_policy" "lambda_known_words_table" {
         Action = [
           "dynamodb:GetItem",
           "dynamodb:PutItem",
-          "dynamodb:UpdateItem"
+          "dynamodb:UpdateItem",
+          "dynamodb:Scan"
         ]
         Resource = aws_dynamodb_table.known_words.arn
+      }
+    ]
+  })
+}
+
+resource "aws_dynamodb_table" "practice_sessions" {
+  name         = "${var.project_name}-${var.environment}-practice-sessions"
+  billing_mode = "PAY_PER_REQUEST"
+
+  hash_key = "telegram_user_id"
+
+  attribute {
+    name = "telegram_user_id"
+    type = "S"
+  }
+
+  ttl {
+    attribute_name = "expires_at"
+    enabled        = true
+  }
+
+  server_side_encryption {
+    enabled = true
+  }
+
+  tags = local.common_tags
+}
+
+resource "aws_iam_role_policy" "lambda_practice_sessions_table" {
+  name = "${var.project_name}-${var.environment}-practice-sessions-table"
+  role = aws_iam_role.lambda_execution.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "dynamodb:GetItem",
+          "dynamodb:PutItem",
+          "dynamodb:UpdateItem",
+          "dynamodb:DeleteItem"
+        ]
+        Resource = aws_dynamodb_table.practice_sessions.arn
       }
     ]
   })

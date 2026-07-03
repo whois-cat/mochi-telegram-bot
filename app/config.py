@@ -51,6 +51,46 @@ STATUS_CREATED = "CREATED"
 STATUS_FAILED = "FAILED"
 
 # ---------------------------------------------------------------------------
+# Practice
+# ---------------------------------------------------------------------------
+
+PRACTICE_MODE_EN_RU = "en_ru"
+PRACTICE_MODE_RU_EN = "ru_en"
+PRACTICE_MODE_CLOZE = "cloze"
+PRACTICE_MODE_WRITE_SENTENCE = "write_sentence"
+
+PRACTICE_MODES = (
+    PRACTICE_MODE_EN_RU,
+    PRACTICE_MODE_RU_EN,
+    PRACTICE_MODE_CLOZE,
+    PRACTICE_MODE_WRITE_SENTENCE,
+)
+
+# Practice word sources.
+PRACTICE_SOURCE_RANDOM = "random"
+PRACTICE_SOURCE_DUE = "due"
+PRACTICE_SOURCE_WEAK = "weak"
+
+PRACTICE_QUESTION_COUNT = 10
+PRACTICE_SCAN_LIMIT = 50
+STATS_SCAN_LIMIT = 500
+PRACTICE_SESSION_TTL_SECONDS = 3600
+
+SESSION_STATUS_ACTIVE = "active"
+
+RESULT_CORRECT = "correct"
+RESULT_WRONG = "wrong"
+
+# Simple spaced repetition: interval in days by streak; longer streaks cap out.
+SRS_INTERVALS_BY_STREAK = {1: 1, 2: 3, 3: 7, 4: 14}
+SRS_MAX_INTERVAL_DAYS = 30
+
+# A word is "weak" when its correct rate falls below this threshold.
+WEAK_CORRECT_RATE_THRESHOLD = 0.6
+
+CLOZE_BLANK = "_____"
+
+# ---------------------------------------------------------------------------
 # User-facing texts
 # ---------------------------------------------------------------------------
 
@@ -59,10 +99,31 @@ HELP_TEXT = (
     "/add reliable | надежный | adjective | This is a reliable source.\n"
     "\n"
     "AI:\n"
-    "/ai reliable"
+    "/ai reliable\n"
+    "\n"
+    "Practice:\n"
+    "/practice — choose a practice mode\n"
+    "/today — review words due today\n"
+    "/weak — review weak words\n"
+    "/stats — word stats"
 )
 
 GENERIC_ERROR_TEXT = "Something went wrong. Please try again later."
+
+PRACTICE_MENU_TEXT = "Choose practice mode:"
+NOT_ENOUGH_WORDS_TEXT = "Not enough saved words for this practice mode yet."
+NO_DUE_WORDS_TEXT = "No words due today."
+NO_WEAK_WORDS_TEXT = "No weak words yet."
+
+# (label, callback_data) pairs for the /practice inline keyboard, one per row.
+PRACTICE_MENU_BUTTONS = (
+    ("EN → RU", f"practice:{PRACTICE_MODE_EN_RU}"),
+    ("RU → EN", f"practice:{PRACTICE_MODE_RU_EN}"),
+    ("Fill blanks x10", f"practice:{PRACTICE_MODE_CLOZE}"),
+    ("Write sentence", f"practice:{PRACTICE_MODE_WRITE_SENTENCE}"),
+    ("Today", "practice:today"),
+    ("Weak words", "practice:weak"),
+)
 
 # Front side: only the word (H2 so it is not oversized). Back side: translation
 # and example. Usage is stored only as a Mochi tag, never in the card text.
@@ -122,5 +183,14 @@ def get_known_words_table_name() -> str:
 
     if not table_name:
         raise RuntimeError("KNOWN_WORDS_TABLE_NAME is not set")
+
+    return table_name
+
+
+def get_practice_sessions_table_name() -> str:
+    table_name = os.environ.get("PRACTICE_SESSIONS_TABLE_NAME")
+
+    if not table_name:
+        raise RuntimeError("PRACTICE_SESSIONS_TABLE_NAME is not set")
 
     return table_name
