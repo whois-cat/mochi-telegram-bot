@@ -27,3 +27,18 @@ output "lambda_image_uri" {
   description = "ECR image URI used by Lambda."
   value       = aws_lambda_function.app.image_uri
 }
+
+output "app_config_secret_name" {
+  description = "Secrets Manager secret name for app config."
+  value       = aws_secretsmanager_secret.app_config.name
+}
+
+output "app_config_secret_arn" {
+  description = "Secrets Manager secret ARN for app config."
+  value       = aws_secretsmanager_secret.app_config.arn
+}
+
+output "known_words_table_name" {
+  description = "DynamoDB table name for known words."
+  value       = aws_dynamodb_table.known_words.name
+}

@@ -108,13 +108,91 @@ resource "aws_lambda_function" "app" {
 
   depends_on = [
     aws_iam_role_policy_attachment.lambda_basic_execution,
+    aws_iam_role_policy.lambda_read_app_config_secret,
+    aws_iam_role_policy.lambda_known_words_table,
     aws_cloudwatch_log_group.lambda
   ]
 
   tags = local.common_tags
+  environment {
+    variables = {
+      APP_CONFIG_SECRET_ID   = aws_secretsmanager_secret.app_config.name
+      KNOWN_WORDS_TABLE_NAME = aws_dynamodb_table.known_words.name
+    }
+  }
 }
 
 resource "aws_lambda_function_url" "app" {
   function_name      = aws_lambda_function.app.function_name
   authorization_type = "NONE"
+}
+
+resource "aws_secretsmanager_secret" "app_config" {
+  name                    = "${var.project_name}/${var.environment}/app-config"
+  description             = "Application secrets for ${var.project_name} ${var.environment}"
+  recovery_window_in_days = 7
+
+  tags = local.common_tags
+}
+
+resource "aws_iam_role_policy" "lambda_read_app_config_secret" {
+  name = "${var.project_name}-${var.environment}-read-app-config-secret"
+  role = aws_iam_role.lambda_execution.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "secretsmanager:GetSecretValue"
+        ]
+        Resource = aws_secretsmanager_secret.app_config.arn
+      }
+    ]
+  })
+}
+
+resource "aws_dynamodb_table" "known_words" {
+  name         = "${var.project_name}-${var.environment}-known-words"
+  billing_mode = "PAY_PER_REQUEST"
+
+  hash_key = "word_key"
+
+  attribute {
+    name = "word_key"
+    type = "S"
+  }
+
+  point_in_time_recovery {
+    enabled = true
+  }
+
+  server_side_encryption {
+    enabled = true
+  }
+
+  deletion_protection_enabled = true
+
+  tags = local.common_tags
+}
+
+resource "aws_iam_role_policy" "lambda_known_words_table" {
+  name = "${var.project_name}-${var.environment}-known-words-table"
+  role = aws_iam_role.lambda_execution.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "dynamodb:GetItem",
+          "dynamodb:PutItem",
+          "dynamodb:UpdateItem"
+        ]
+        Resource = aws_dynamodb_table.known_words.arn
+      }
+    ]
+  })
 }
