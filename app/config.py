@@ -125,6 +125,20 @@ PRACTICE_MENU_BUTTONS = (
     ("Weak words", "practice:weak"),
 )
 
+# (label, callback_data) pairs shown under help / unknown-command replies.
+HELP_MENU_BUTTONS = (
+    ("Practice", "practice:menu"),
+    ("Today", "practice:today"),
+    ("Weak words", "practice:weak"),
+    ("Stats", "practice:stats"),
+)
+
+REGENERATE_BUTTON_TEXT = "Regenerate"
+CALLBACK_REGEN_PREFIX = "regen:"
+TELEGRAM_CALLBACK_DATA_MAX_BYTES = 64
+
+WORD_NOT_FOUND_TEXT = "Word not found."
+
 # Front side: only the word (H2 so it is not oversized). Back side: translation
 # and example. Usage is stored only as a Mochi tag, never in the card text.
 MOCHI_CARD_TEMPLATE = (

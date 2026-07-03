@@ -17,9 +17,11 @@ import requests
 from botocore.exceptions import ClientError
 
 from app.config import (
+    CALLBACK_REGEN_PREFIX,
     CLOZE_BLANK,
     GEMINI_TIMEOUT_MS,
     GENERIC_ERROR_TEXT,
+    HELP_MENU_BUTTONS,
     HELP_TEXT,
     MOCHI_API_URL,
     MOCHI_CARD_TEMPLATE,
@@ -40,6 +42,7 @@ from app.config import (
     PRACTICE_SOURCE_DUE,
     PRACTICE_SOURCE_RANDOM,
     PRACTICE_SOURCE_WEAK,
+    REGENERATE_BUTTON_TEXT,
     RESULT_CORRECT,
     RESULT_WRONG,
     SESSION_STATUS_ACTIVE,
@@ -50,9 +53,11 @@ from app.config import (
     STATUS_FAILED,
     STATUS_RESERVED,
     TELEGRAM_API_BASE,
+    TELEGRAM_CALLBACK_DATA_MAX_BYTES,
     TELEGRAM_TIMEOUT_SECONDS,
     USAGE_ALIASES,
     WEAK_CORRECT_RATE_THRESHOLD,
+    WORD_NOT_FOUND_TEXT,
     get_app_config,
     get_known_words_table_name,
     get_practice_sessions_table_name,
@@ -102,6 +107,8 @@ class AddCardResult:
     created: bool
     word: str
     mochi_card_id: str | None = None
+    translation: str | None = None
+    example: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -386,6 +393,34 @@ def create_mochi_card(card: CardInput, usage_tag: str, config: dict[str, str]) -
         return {}
 
 
+def update_mochi_card(
+    card_id: str,
+    card: CardInput,
+    usage_tag: str,
+    config: dict[str, str],
+) -> None:
+    payload = {
+        "content": build_mochi_content(card),
+        "manual-tags": ["english", "from-telegram", usage_tag],
+    }
+
+    response = requests.post(
+        f"{MOCHI_API_URL}{card_id}",
+        json=payload,
+        auth=(config["MOCHI_API_KEY"], ""),
+        headers={"Accept": "application/json", "Content-Type": "application/json"},
+        timeout=MOCHI_TIMEOUT_SECONDS,
+    )
+
+    if response.status_code >= 400:
+        log_event(
+            "mochi_api_error",
+            status_code=response.status_code,
+            response_preview=response.text[:300],
+        )
+        raise HttpError(502, "Mochi API request failed")
+
+
 # ---------------------------------------------------------------------------
 # Gemini helpers
 # ---------------------------------------------------------------------------
@@ -529,6 +564,8 @@ def add_card(card: CardInput, config: dict[str, str], *, source: str = "telegram
             created=False,
             word=existing.get("word") or card.word,
             mochi_card_id=existing.get("mochi_card_id") or None,
+            translation=existing.get("translation") or None,
+            example=existing.get("example") or None,
         )
 
     word_key = reservation["item"]["word_key"]
@@ -542,7 +579,13 @@ def add_card(card: CardInput, config: dict[str, str], *, source: str = "telegram
     mochi_card_id = mochi_card.get("id")
     mark_known_word_created(word_key=word_key, mochi_card_id=mochi_card_id)
 
-    return AddCardResult(created=True, word=card.word, mochi_card_id=mochi_card_id)
+    return AddCardResult(
+        created=True,
+        word=card.word,
+        mochi_card_id=mochi_card_id,
+        translation=card.translation,
+        example=card.example,
+    )
 
 
 def add_ai_card(word_or_phrase: str, config: dict[str, str]) -> AddCardResult:
@@ -557,10 +600,60 @@ def add_ai_card(word_or_phrase: str, config: dict[str, str]) -> AddCardResult:
             created=False,
             word=existing.get("word") or word_or_phrase,
             mochi_card_id=existing.get("mochi_card_id") or None,
+            translation=existing.get("translation") or None,
+            example=existing.get("example") or None,
         )
 
     card = generate_card_with_ai(word_or_phrase, config)
     return add_card(card, config, source="telegram")
+
+
+def regenerate_card(normalized_word: str, config: dict[str, str]) -> AddCardResult:
+    """
+    Regenerate translation/example with Gemini for an already saved word,
+    updating both the Mochi card (when it exists) and the DynamoDB item.
+    """
+    table = get_known_words_table()
+    word_key = build_word_key(
+        deck_id=config["MOCHI_DECK_ID"],
+        normalized_word=normalized_word,
+    )
+    item = table.get_item(Key={"word_key": word_key}, ConsistentRead=True).get("Item")
+
+    if not item:
+        raise UserInputError(WORD_NOT_FOUND_TEXT)
+
+    word = str(item.get("word") or normalized_word)
+    card = generate_card_with_ai(word, config)
+    usage_tag = normalize_usage_tag(card.usage)
+
+    mochi_card_id = item.get("mochi_card_id")
+    if mochi_card_id:
+        update_mochi_card(str(mochi_card_id), card, usage_tag, config)
+
+    table.update_item(
+        Key={"word_key": word_key},
+        UpdateExpression=(
+            "SET translation = :translation, example = :example, "
+            "usage_tag = :usage_tag, updated_at = :updated_at"
+        ),
+        ExpressionAttributeValues={
+            ":translation": card.translation,
+            ":example": card.example,
+            ":usage_tag": usage_tag,
+            ":updated_at": utc_now_iso(),
+        },
+    )
+
+    log_event("card_regenerated", has_mochi_card=bool(mochi_card_id))
+
+    return AddCardResult(
+        created=True,
+        word=word,
+        mochi_card_id=str(mochi_card_id) if mochi_card_id else None,
+        translation=card.translation,
+        example=card.example,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -614,6 +707,24 @@ def build_practice_menu() -> dict[str, Any]:
             [{"text": label, "callback_data": data}] for label, data in PRACTICE_MENU_BUTTONS
         ]
     }
+
+
+def build_help_menu() -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [{"text": label, "callback_data": data}] for label, data in HELP_MENU_BUTTONS
+        ]
+    }
+
+
+def build_regenerate_keyboard(word: str) -> dict[str, Any] | None:
+    """None when the word does not fit Telegram's callback_data size limit."""
+    data = CALLBACK_REGEN_PREFIX + normalize_word_for_lookup(word)
+
+    if len(data.encode("utf-8")) > TELEGRAM_CALLBACK_DATA_MAX_BYTES:
+        return None
+
+    return {"inline_keyboard": [[{"text": REGENERATE_BUTTON_TEXT, "callback_data": data}]]}
 
 
 def parse_telegram_command(text: str) -> TelegramCommand:
@@ -675,13 +786,22 @@ def extract_telegram_message(update: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
-def build_add_result_reply(result: dict[str, Any]) -> str:
-    word = html.escape(str(result.get("word", "")))
+def build_add_result_reply(
+    result: AddCardResult,
+    *,
+    title: str | None = None,
+) -> tuple[str, dict[str, Any] | None]:
+    """Card summary with what goes to Mochi, plus a Regenerate button."""
+    word = html.escape(result.word)
+    status = title or ("✅ Added" if result.created else "🔁 Exists")
 
-    if result.get("created"):
-        return f"✅ Added: <b>{word}</b>"
+    lines = [f"{status}: <b>{word}</b>"]
+    if result.translation:
+        lines += ["", f"<b>{html.escape(result.translation)}</b>"]
+    if result.example:
+        lines.append(f"<i>{html.escape(result.example)}</i>")
 
-    return f"🔁 Exists: <b>{word}</b>"
+    return "\n".join(lines), build_regenerate_keyboard(result.word)
 
 
 def process_telegram_text(
@@ -703,7 +823,7 @@ def process_telegram_text(
     log_event("telegram_command", mode=command.mode)
 
     if command.mode == "help":
-        return HELP_TEXT, None
+        return HELP_TEXT, build_help_menu()
 
     if command.mode == "practice_menu":
         return PRACTICE_MENU_TEXT, build_practice_menu()
@@ -722,10 +842,9 @@ def process_telegram_text(
         return build_stats_reply(), None
 
     if command.mode == "manual":
-        result = add_card(command.card, config, source="telegram")
-        return build_add_result_reply(result.to_dict()), None
+        return build_add_result_reply(add_card(command.card, config, source="telegram"))
 
-    return build_add_result_reply(add_ai_card(command.query, config).to_dict()), None
+    return build_add_result_reply(add_ai_card(command.query, config))
 
 
 # ---------------------------------------------------------------------------
@@ -1149,7 +1268,37 @@ def handle_add_card(event: dict[str, Any]) -> dict[str, Any]:
     return json_response(200, result.to_dict())
 
 
-def handle_practice_callback(callback_query: dict[str, Any], config: dict[str, str]) -> None:
+def dispatch_callback(data: str, user_id: str, config: dict[str, str]) -> tuple[str, dict[str, Any] | None] | None:
+    """Returns (reply, reply_markup) for known callback_data, None for unknown."""
+    if data.startswith(CALLBACK_REGEN_PREFIX):
+        result = regenerate_card(data[len(CALLBACK_REGEN_PREFIX):], config)
+        return build_add_result_reply(result, title="Regenerated")
+
+    if not data.startswith("practice:"):
+        return None
+
+    choice = data.split(":", 1)[1]
+    log_event("practice_callback", choice=choice)
+
+    if choice == "menu":
+        return PRACTICE_MENU_TEXT, build_practice_menu()
+
+    if choice == "stats":
+        return build_stats_reply(), None
+
+    if choice == "today":
+        return start_practice_session(user_id, PRACTICE_MODE_EN_RU, source=PRACTICE_SOURCE_DUE), None
+
+    if choice == "weak":
+        return start_practice_session(user_id, PRACTICE_MODE_EN_RU, source=PRACTICE_SOURCE_WEAK), None
+
+    if choice in PRACTICE_MODES:
+        return start_practice_session(user_id, choice), None
+
+    return None
+
+
+def handle_callback_query(callback_query: dict[str, Any], config: dict[str, str]) -> None:
     callback_query_id = callback_query.get("id")
     if callback_query_id:
         answer_callback_query(str(callback_query_id), config)
@@ -1158,30 +1307,25 @@ def handle_practice_callback(callback_query: dict[str, Any], config: dict[str, s
     user_id = (callback_query.get("from") or {}).get("id")
     data = callback_query.get("data") or ""
 
-    if not chat_id or not user_id or not data.startswith("practice:"):
+    if not chat_id or not user_id:
         return
 
-    choice = data.split(":", 1)[1]
-    log_event("practice_callback", choice=choice)
+    reply_markup = None
 
     try:
-        if choice == "today":
-            reply = start_practice_session(
-                str(user_id), PRACTICE_MODE_EN_RU, source=PRACTICE_SOURCE_DUE
-            )
-        elif choice == "weak":
-            reply = start_practice_session(
-                str(user_id), PRACTICE_MODE_EN_RU, source=PRACTICE_SOURCE_WEAK
-            )
-        elif choice in PRACTICE_MODES:
-            reply = start_practice_session(str(user_id), choice)
-        else:
+        dispatched = dispatch_callback(data, str(user_id), config)
+        if dispatched is None:
             return
+        reply, reply_markup = dispatched
+    except UserInputError as error:
+        reply = str(error)
+    except AiGenerationError:
+        reply = "AI could not generate this card. Please try again later."
     except Exception as error:
-        log_event("practice_callback_error", error_type=type(error).__name__)
+        log_event("callback_error", error_type=type(error).__name__)
         reply = GENERIC_ERROR_TEXT
 
-    send_telegram_message(chat_id=chat_id, text=reply, config=config)
+    send_telegram_message(chat_id=chat_id, text=reply, config=config, reply_markup=reply_markup)
 
 
 def handle_telegram_webhook(event: dict[str, Any]) -> dict[str, Any]:
@@ -1192,7 +1336,7 @@ def handle_telegram_webhook(event: dict[str, Any]) -> dict[str, Any]:
 
     callback_query = update.get("callback_query")
     if isinstance(callback_query, dict):
-        handle_practice_callback(callback_query, config)
+        handle_callback_query(callback_query, config)
         return json_response(200, {"ok": True})
 
     message = extract_telegram_message(update)
@@ -1214,7 +1358,8 @@ def handle_telegram_webhook(event: dict[str, Any]) -> dict[str, Any]:
             text, config, telegram_user_id=telegram_user_id
         )
     except UserInputError as error:
-        reply = str(error)
+        # Input-format errors quote HELP_TEXT, so attach the help buttons too.
+        reply, reply_markup = str(error), build_help_menu()
     except AiGenerationError:
         reply = "AI could not generate this card. Please try again later."
     except Exception as error:
