@@ -17,8 +17,15 @@ import requests
 from botocore.exceptions import ClientError
 
 from app.config import (
+    CALLBACK_CANCEL,
+    CALLBACK_DELETE_CONFIRM_PREFIX,
+    CALLBACK_DELETE_PREFIX,
     CALLBACK_REGEN_PREFIX,
+    CANCEL_BUTTON_TEXT,
+    CANCELLED_TEXT,
     CLOZE_BLANK,
+    CONFIRM_DELETE_BUTTON_TEXT,
+    DELETE_BUTTON_TEXT,
     GEMINI_TIMEOUT_MS,
     GENERIC_ERROR_TEXT,
     HELP_MENU_BUTTONS,
@@ -398,7 +405,8 @@ def update_mochi_card(
     card: CardInput,
     usage_tag: str,
     config: dict[str, str],
-) -> None:
+) -> bool:
+    """False when the card no longer exists in Mochi (deleted there manually)."""
     payload = {
         "content": build_mochi_content(card),
         "manual-tags": ["english", "from-telegram", usage_tag],
@@ -412,7 +420,30 @@ def update_mochi_card(
         timeout=MOCHI_TIMEOUT_SECONDS,
     )
 
+    if response.status_code == 404:
+        return False
+
     if response.status_code >= 400:
+        log_event(
+            "mochi_api_error",
+            status_code=response.status_code,
+            response_preview=response.text[:300],
+        )
+        raise HttpError(502, "Mochi API request failed")
+
+    return True
+
+
+def delete_mochi_card(card_id: str, config: dict[str, str]) -> None:
+    """404 is fine: the card is already gone in Mochi."""
+    response = requests.delete(
+        f"{MOCHI_API_URL}{card_id}",
+        auth=(config["MOCHI_API_KEY"], ""),
+        headers={"Accept": "application/json"},
+        timeout=MOCHI_TIMEOUT_SECONDS,
+    )
+
+    if response.status_code >= 400 and response.status_code != 404:
         log_event(
             "mochi_api_error",
             status_code=response.status_code,
@@ -627,22 +658,27 @@ def regenerate_card(normalized_word: str, config: dict[str, str]) -> AddCardResu
     card = generate_card_with_ai(word, config)
     usage_tag = normalize_usage_tag(card.usage)
 
-    mochi_card_id = item.get("mochi_card_id")
-    if mochi_card_id:
-        update_mochi_card(str(mochi_card_id), card, usage_tag, config)
+    # DynamoDB is the source of truth: if the card is missing in Mochi
+    # (deleted there manually, or never created), recreate it.
+    mochi_card_id = str(item.get("mochi_card_id") or "")
+    if not mochi_card_id or not update_mochi_card(mochi_card_id, card, usage_tag, config):
+        mochi_card_id = str(create_mochi_card(card, usage_tag, config).get("id") or "")
 
     table.update_item(
         Key={"word_key": word_key},
-        # "translation" is a DynamoDB reserved keyword, so alias it.
+        # "translation" and "status" are DynamoDB reserved keywords.
         UpdateExpression=(
             "SET #translation = :translation, example = :example, "
-            "usage_tag = :usage_tag, updated_at = :updated_at"
+            "usage_tag = :usage_tag, mochi_card_id = :mochi_card_id, "
+            "#status = :status, updated_at = :updated_at"
         ),
-        ExpressionAttributeNames={"#translation": "translation"},
+        ExpressionAttributeNames={"#translation": "translation", "#status": "status"},
         ExpressionAttributeValues={
             ":translation": card.translation,
             ":example": card.example,
             ":usage_tag": usage_tag,
+            ":mochi_card_id": mochi_card_id,
+            ":status": STATUS_CREATED,
             ":updated_at": utc_now_iso(),
         },
     )
@@ -652,10 +688,33 @@ def regenerate_card(normalized_word: str, config: dict[str, str]) -> AddCardResu
     return AddCardResult(
         created=True,
         word=word,
-        mochi_card_id=str(mochi_card_id) if mochi_card_id else None,
+        mochi_card_id=mochi_card_id or None,
         translation=card.translation,
         example=card.example,
     )
+
+
+def delete_known_word(normalized_word: str, config: dict[str, str]) -> str:
+    """Delete the word from DynamoDB and its card from Mochi."""
+    table = get_known_words_table()
+    word_key = build_word_key(
+        deck_id=config["MOCHI_DECK_ID"],
+        normalized_word=normalized_word,
+    )
+    item = table.get_item(Key={"word_key": word_key}, ConsistentRead=True).get("Item")
+
+    if not item:
+        return WORD_NOT_FOUND_TEXT
+
+    mochi_card_id = item.get("mochi_card_id")
+    if mochi_card_id:
+        delete_mochi_card(str(mochi_card_id), config)
+
+    table.delete_item(Key={"word_key": word_key})
+    log_event("card_deleted", has_mochi_card=bool(mochi_card_id))
+
+    word = html.escape(str(item.get("word") or normalized_word))
+    return f"Deleted: <b>{word}</b>"
 
 
 # ---------------------------------------------------------------------------
@@ -719,14 +778,58 @@ def build_help_menu() -> dict[str, Any]:
     return build_inline_keyboard(HELP_MENU_BUTTONS)
 
 
-def build_regenerate_keyboard(word: str) -> dict[str, Any] | None:
+def callback_data_for(prefix: str, word: str) -> str | None:
     """None when the word does not fit Telegram's callback_data size limit."""
-    data = CALLBACK_REGEN_PREFIX + normalize_word_for_lookup(word)
+    data = prefix + normalize_word_for_lookup(word)
 
     if len(data.encode("utf-8")) > TELEGRAM_CALLBACK_DATA_MAX_BYTES:
         return None
 
-    return {"inline_keyboard": [[{"text": REGENERATE_BUTTON_TEXT, "callback_data": data}]]}
+    return data
+
+
+def build_card_actions_keyboard(word: str) -> dict[str, Any] | None:
+    regen = callback_data_for(CALLBACK_REGEN_PREFIX, word)
+    delete = callback_data_for(CALLBACK_DELETE_PREFIX, word)
+
+    if not regen or not delete:
+        return None
+
+    return {
+        "inline_keyboard": [
+            [
+                {"text": REGENERATE_BUTTON_TEXT, "callback_data": regen},
+                {"text": DELETE_BUTTON_TEXT, "callback_data": delete},
+            ]
+        ]
+    }
+
+
+def build_delete_confirmation(normalized_word: str, config: dict[str, str]) -> tuple[str, dict[str, Any] | None]:
+    word_key = build_word_key(
+        deck_id=config["MOCHI_DECK_ID"],
+        normalized_word=normalized_word,
+    )
+    item = get_known_words_table().get_item(Key={"word_key": word_key}).get("Item")
+
+    if not item:
+        return WORD_NOT_FOUND_TEXT, None
+
+    word = str(item.get("word") or normalized_word)
+    confirm = callback_data_for(CALLBACK_DELETE_CONFIRM_PREFIX, word)
+
+    if not confirm:
+        return WORD_NOT_FOUND_TEXT, None
+
+    keyboard = {
+        "inline_keyboard": [
+            [
+                {"text": CONFIRM_DELETE_BUTTON_TEXT, "callback_data": confirm},
+                {"text": CANCEL_BUTTON_TEXT, "callback_data": CALLBACK_CANCEL},
+            ]
+        ]
+    }
+    return f"Delete <b>{html.escape(word)}</b>? It will also be removed from Mochi.", keyboard
 
 
 def parse_telegram_command(text: str) -> TelegramCommand:
@@ -734,6 +837,7 @@ def parse_telegram_command(text: str) -> TelegramCommand:
     Supported:
       /add word | translation | usage | example  -> mode="manual"
       /ai word_or_phrase                         -> mode="ai"
+      /delete word                               -> mode="delete"
       /help, /start                              -> mode="help"
       /practice                                  -> mode="practice_menu"
       /today                                     -> mode="practice_today"
@@ -777,6 +881,11 @@ def parse_telegram_command(text: str) -> TelegramCommand:
             raise UserInputError(f"Please add a word or phrase:\n\n{HELP_TEXT}")
         return TelegramCommand(mode="ai", query=rest)
 
+    if command == "/delete":
+        if not rest:
+            raise UserInputError(f"Please add a word to delete:\n\n{HELP_TEXT}")
+        return TelegramCommand(mode="delete", query=rest)
+
     raise UserInputError(f"I don't know that command.\n\n{HELP_TEXT}")
 
 
@@ -803,7 +912,7 @@ def build_add_result_reply(
     if result.example:
         lines.append(f"<i>{html.escape(result.example)}</i>")
 
-    return "\n".join(lines), build_regenerate_keyboard(result.word)
+    return "\n".join(lines), build_card_actions_keyboard(result.word)
 
 
 def process_telegram_text(
@@ -842,6 +951,9 @@ def process_telegram_text(
 
     if command.mode == "stats":
         return build_stats_reply(), None
+
+    if command.mode == "delete":
+        return build_delete_confirmation(normalize_word_for_lookup(command.query), config)
 
     if command.mode == "manual":
         return build_add_result_reply(add_card(command.card, config, source="telegram"))
@@ -1275,6 +1387,15 @@ def dispatch_callback(data: str, user_id: str, config: dict[str, str]) -> tuple[
     if data.startswith(CALLBACK_REGEN_PREFIX):
         result = regenerate_card(data[len(CALLBACK_REGEN_PREFIX):], config)
         return build_add_result_reply(result, title="Regenerated")
+
+    if data.startswith(CALLBACK_DELETE_CONFIRM_PREFIX):
+        return delete_known_word(data[len(CALLBACK_DELETE_CONFIRM_PREFIX):], config), None
+
+    if data.startswith(CALLBACK_DELETE_PREFIX):
+        return build_delete_confirmation(data[len(CALLBACK_DELETE_PREFIX):], config)
+
+    if data == CALLBACK_CANCEL:
+        return CANCELLED_TEXT, None
 
     if not data.startswith("practice:"):
         return None

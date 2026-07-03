@@ -192,6 +192,7 @@ resource "aws_iam_role_policy" "lambda_known_words_table" {
           "dynamodb:GetItem",
           "dynamodb:PutItem",
           "dynamodb:UpdateItem",
+          "dynamodb:DeleteItem",
           "dynamodb:Scan"
         ]
         Resource = aws_dynamodb_table.known_words.arn

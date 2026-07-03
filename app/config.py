@@ -101,6 +101,9 @@ HELP_TEXT = (
     "AI:\n"
     "/ai reliable\n"
     "\n"
+    "Delete:\n"
+    "/delete reliable\n"
+    "\n"
     "Everything else is on the buttons below."
 )
 
@@ -140,10 +143,18 @@ HELP_MENU_BUTTONS = (
 )
 
 REGENERATE_BUTTON_TEXT = "Regenerate"
+DELETE_BUTTON_TEXT = "Delete"
+CONFIRM_DELETE_BUTTON_TEXT = "Yes, delete"
+CANCEL_BUTTON_TEXT = "Cancel"
+
 CALLBACK_REGEN_PREFIX = "regen:"
+CALLBACK_DELETE_PREFIX = "del:"
+CALLBACK_DELETE_CONFIRM_PREFIX = "delc:"
+CALLBACK_CANCEL = "cancel"
 TELEGRAM_CALLBACK_DATA_MAX_BYTES = 64
 
 WORD_NOT_FOUND_TEXT = "Word not found."
+CANCELLED_TEXT = "Cancelled."
 
 # Front side: only the word (H2 so it is not oversized). Back side: translation
 # and example. Usage is stored only as a Mochi tag, never in the card text.
