@@ -703,20 +703,20 @@ def answer_callback_query(callback_query_id: str, config: dict[str, str]) -> Non
         )
 
 
-def build_practice_menu() -> dict[str, Any]:
+def build_inline_keyboard(rows: tuple) -> dict[str, Any]:
     return {
         "inline_keyboard": [
-            [{"text": label, "callback_data": data}] for label, data in PRACTICE_MENU_BUTTONS
+            [{"text": label, "callback_data": data} for label, data in row] for row in rows
         ]
     }
+
+
+def build_practice_menu() -> dict[str, Any]:
+    return build_inline_keyboard(PRACTICE_MENU_BUTTONS)
 
 
 def build_help_menu() -> dict[str, Any]:
-    return {
-        "inline_keyboard": [
-            [{"text": label, "callback_data": data}] for label, data in HELP_MENU_BUTTONS
-        ]
-    }
+    return build_inline_keyboard(HELP_MENU_BUTTONS)
 
 
 def build_regenerate_keyboard(word: str) -> dict[str, Any] | None:

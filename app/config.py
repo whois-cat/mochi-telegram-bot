@@ -101,11 +101,7 @@ HELP_TEXT = (
     "AI:\n"
     "/ai reliable\n"
     "\n"
-    "Practice:\n"
-    "/practice — choose a practice mode\n"
-    "/today — review words due today\n"
-    "/weak — review weak words\n"
-    "/stats — word stats"
+    "Everything else is on the buttons below."
 )
 
 GENERIC_ERROR_TEXT = "Something went wrong. Please try again later."
@@ -115,22 +111,32 @@ NOT_ENOUGH_WORDS_TEXT = "Not enough saved words for this practice mode yet."
 NO_DUE_WORDS_TEXT = "No words due today."
 NO_WEAK_WORDS_TEXT = "No weak words yet."
 
-# (label, callback_data) pairs for the /practice inline keyboard, one per row.
+# Inline keyboards as rows of (label, callback_data) pairs.
 PRACTICE_MENU_BUTTONS = (
-    ("EN → RU", f"practice:{PRACTICE_MODE_EN_RU}"),
-    ("RU → EN", f"practice:{PRACTICE_MODE_RU_EN}"),
-    ("Fill blanks x10", f"practice:{PRACTICE_MODE_CLOZE}"),
-    ("Write sentence", f"practice:{PRACTICE_MODE_WRITE_SENTENCE}"),
-    ("Today", "practice:today"),
-    ("Weak words", "practice:weak"),
+    (
+        ("EN → RU", f"practice:{PRACTICE_MODE_EN_RU}"),
+        ("RU → EN", f"practice:{PRACTICE_MODE_RU_EN}"),
+    ),
+    (
+        ("Fill blanks x10", f"practice:{PRACTICE_MODE_CLOZE}"),
+        ("Write sentence", f"practice:{PRACTICE_MODE_WRITE_SENTENCE}"),
+    ),
+    (
+        ("Today", "practice:today"),
+        ("Weak words", "practice:weak"),
+    ),
 )
 
-# (label, callback_data) pairs shown under help / unknown-command replies.
+# Shown under help / unknown-command replies.
 HELP_MENU_BUTTONS = (
-    ("Practice", "practice:menu"),
-    ("Today", "practice:today"),
-    ("Weak words", "practice:weak"),
-    ("Stats", "practice:stats"),
+    (
+        ("Practice", "practice:menu"),
+        ("Stats", "practice:stats"),
+    ),
+    (
+        ("Today", "practice:today"),
+        ("Weak words", "practice:weak"),
+    ),
 )
 
 REGENERATE_BUTTON_TEXT = "Regenerate"
