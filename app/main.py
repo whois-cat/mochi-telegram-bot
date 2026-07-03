@@ -633,10 +633,12 @@ def regenerate_card(normalized_word: str, config: dict[str, str]) -> AddCardResu
 
     table.update_item(
         Key={"word_key": word_key},
+        # "translation" is a DynamoDB reserved keyword, so alias it.
         UpdateExpression=(
-            "SET translation = :translation, example = :example, "
+            "SET #translation = :translation, example = :example, "
             "usage_tag = :usage_tag, updated_at = :updated_at"
         ),
+        ExpressionAttributeNames={"#translation": "translation"},
         ExpressionAttributeValues={
             ":translation": card.translation,
             ":example": card.example,
