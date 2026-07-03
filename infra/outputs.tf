@@ -42,3 +42,8 @@ output "known_words_table_name" {
   description = "DynamoDB table name for known words."
   value       = aws_dynamodb_table.known_words.name
 }
+
+output "github_actions_role_arn" {
+  description = "IAM role ARN assumed by GitHub Actions via OIDC."
+  value       = aws_iam_role.github_actions_deploy.arn
+}

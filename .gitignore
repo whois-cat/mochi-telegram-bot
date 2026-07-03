@@ -5,11 +5,15 @@ dist/
 wheels/
 *.egg-info
 
-.venv/
-lambda.zip
-build/
-.env
+# Terraform
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
 
-infra/.terraform/
-infra/terraform.tfstate
-infra/terraform.tfstate.backup
+# Local secrets
+.env
+*.env
+secret*.json
