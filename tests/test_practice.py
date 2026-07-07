@@ -51,8 +51,19 @@ class PracticeTests(unittest.TestCase):
                 for number, item in enumerate(selected_words, 1)
             }
 
+        def fake_generate_cloze(selected_words, support_words, _config):
+            support_word = support_words[0]["word"]
+            return {
+                item["word_key"]: {
+                    "sentence": f"Could you {item['word']} this idea before we {support_word} it?",
+                    "support_words": [support_word],
+                }
+                for item in selected_words
+            }
+
         with (
             patch("app.main.get_known_words_for_practice", return_value=words),
+            patch("app.main.generate_cloze_tasks_with_gemini", side_effect=fake_generate_cloze),
             patch("app.main.generate_translation_tasks_with_gemini", side_effect=fake_generate),
             patch("app.main.random.random", return_value=0.0),
         ):
@@ -71,6 +82,9 @@ class PracticeTests(unittest.TestCase):
             [task["task_type"] for task in tasks[20:]],
             [config.TASK_TYPE_OWN_SENTENCE] * 10,
         )
+        self.assertIn(config.CLOZE_BLANK, tasks[0]["prompt"])
+        self.assertNotIn("I need to", tasks[0]["prompt"])
+        self.assertEqual(tasks[0]["support_words"], ["word10"])
 
     def test_candidate_scoring_prioritizes_problem_words(self):
         now = datetime.now(timezone.utc)

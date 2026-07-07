@@ -113,7 +113,7 @@ HELP_TEXT = (
 
 GENERIC_ERROR_TEXT = "Something went wrong. Please try again later."
 
-NOT_ENOUGH_WORDS_TEXT = "Need at least 30 saved words with examples for active practice."
+NOT_ENOUGH_WORDS_TEXT = "Need at least 30 saved words for active practice."
 TODAY_PRACTICE_INTRO = "Today's active practice. Fill in the blanks:"
 EDIT_CARD_PROMPT = (
     "Send the updated card in this format:\n\n"

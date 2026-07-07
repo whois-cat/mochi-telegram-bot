@@ -617,6 +617,92 @@ def evaluate_sentence_with_gemini(
     }
 
 
+def generate_cloze_tasks_with_gemini(
+    items: list[dict[str, Any]],
+    support_items: list[dict[str, Any]],
+    config: dict[str, str],
+) -> dict[str, dict[str, Any]]:
+    """Generate fresh cloze sentences keyed by word_key."""
+    if genai is None:
+        log_event("gemini_sdk_missing")
+        raise AiGenerationError("google-genai SDK is not installed")
+
+    target_payload = [
+        {
+            "id": str(item["word_key"]),
+            "word": str(item.get("word") or ""),
+            "translation": str(item.get("translation") or ""),
+            "usage": str(item.get("usage_tag") or ""),
+        }
+        for item in items
+    ]
+    target_words = {str(item.get("word") or "").casefold() for item in items}
+    word_bank_payload = [
+        {
+            "word": str(item.get("word") or ""),
+            "translation": str(item.get("translation") or ""),
+        }
+        for item in support_items
+        if str(item.get("word") or "").casefold() not in target_words
+    ]
+
+    client = genai.Client(
+        api_key=config["GEMINI_API_KEY"],
+        http_options=genai_types.HttpOptions(timeout=GEMINI_TIMEOUT_MS),
+    )
+    prompt = (
+        load_prompt("gemini_cloze_tasks")
+        .replace("{target_items_json}", json.dumps(target_payload, ensure_ascii=False))
+        .replace("{word_bank_json}", json.dumps(word_bank_payload, ensure_ascii=False))
+    )
+
+    try:
+        response = client.models.generate_content(
+            model=config["GEMINI_MODEL"],
+            contents=prompt,
+            config=genai_types.GenerateContentConfig(
+                response_mime_type="application/json",
+            ),
+        )
+    except Exception as error:
+        log_event("gemini_request_error", error_type=type(error).__name__)
+        raise AiGenerationError("Gemini request failed") from error
+
+    raw_text = (response.text or "").strip()
+
+    try:
+        data = json.loads(raw_text)
+    except json.JSONDecodeError:
+        log_event("gemini_invalid_json", response_preview=raw_text[:120])
+        raise AiGenerationError("Gemini returned invalid JSON")
+
+    tasks = data.get("tasks") if isinstance(data, dict) else None
+    if not isinstance(tasks, list):
+        log_event("gemini_invalid_shape")
+        raise AiGenerationError("Gemini returned an invalid cloze task list")
+
+    generated: dict[str, dict[str, Any]] = {}
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+
+        task_id = str(task.get("id") or "")
+        sentence = str(task.get("sentence") or "").strip()
+        support_words = task.get("support_words") or []
+        if not isinstance(support_words, list):
+            support_words = []
+
+        if task_id and sentence:
+            generated[task_id] = {
+                "sentence": sentence,
+                "support_words": [
+                    str(word).strip() for word in support_words if str(word).strip()
+                ],
+            }
+
+    return generated
+
+
 def generate_translation_tasks_with_gemini(
     items: list[dict[str, Any]],
     config: dict[str, str],
@@ -1364,14 +1450,7 @@ def word_fits_active_practice(item: dict[str, Any]) -> bool:
 
 
 def word_fits_blank_practice(item: dict[str, Any]) -> bool:
-    if not word_fits_active_practice(item):
-        return False
-
-    return build_cloze_sentence(
-        str(item.get("word") or ""),
-        str(item.get("example") or ""),
-        str(item.get("cloze_sentence") or ""),
-    ) is not None
+    return word_fits_active_practice(item)
 
 
 def parse_iso_datetime(value: Any) -> datetime | None:
@@ -1443,28 +1522,36 @@ def choose_practice_block(
     return ranked[:limit]
 
 
-def build_today_practice_questions(words: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def build_today_practice_questions(
+    words: list[dict[str, Any]],
+    support_words: list[dict[str, Any]],
+    config: dict[str, str],
+) -> list[dict[str, Any]]:
+    generated_tasks = generate_cloze_tasks_with_gemini(words, support_words, config)
     questions = []
 
     for item in words:
+        word_key = str(item["word_key"])
         word = str(item.get("word") or "")
         translation = str(item.get("translation") or "")
-        blanked = build_cloze_sentence(
-            word,
-            str(item.get("example") or ""),
-            str(item.get("cloze_sentence") or ""),
-        )
+        generated = generated_tasks.get(word_key)
+        if not generated:
+            raise AiGenerationError("Gemini did not generate all cloze tasks")
 
+        generated_sentence = str(generated.get("sentence") or "")
+        blanked = build_cloze_sentence(word, generated_sentence)
         if not blanked:
-            continue
+            raise AiGenerationError("Gemini generated a cloze sentence without the target word")
 
         questions.append(
             {
                 "task_type": TASK_TYPE_FILL_BLANK,
-                "linked_word_keys": [item["word_key"]],
+                "linked_word_keys": [word_key],
                 "word": word,
                 "translation": translation,
                 "prompt": f"{blanked} ({translation})",
+                "source_sentence": generated_sentence,
+                "support_words": generated.get("support_words") or [],
                 "expected_answer": word,
                 "acceptable_answers": [word],
             }
@@ -1572,7 +1659,8 @@ def build_today_practice_tasks(config: dict[str, str]) -> list[dict[str, Any]]:
         return []
 
     tasks = []
-    tasks.extend(build_today_practice_questions(blank_words))
+    support_words = [*translation_words, *own_sentence_words, *blank_words]
+    tasks.extend(build_today_practice_questions(blank_words, support_words, config))
     tasks.extend(build_translation_practice_questions(translation_words, config))
     tasks.extend(build_own_sentence_practice_questions(own_sentence_words))
     return tasks

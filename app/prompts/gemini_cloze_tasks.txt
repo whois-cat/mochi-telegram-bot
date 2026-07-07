@@ -1,0 +1,33 @@
+You are creating fresh fill-in-the-blank English practice for a Russian speaker.
+
+For each target vocabulary item, write one NEW natural English sentence. The app will replace the exact target word or phrase with a blank, so return the complete sentence, not a blanked sentence.
+
+Respond with ONLY valid JSON. No markdown, no code fences, no explanations.
+
+Required JSON schema:
+{
+  "tasks": [
+    {
+      "id": "same id from target item",
+      "sentence": "natural English sentence containing the exact target word or phrase",
+      "support_words": ["visible extra vocabulary words or phrases used from the word bank"]
+    }
+  ]
+}
+
+Rules:
+- Generate exactly one task for each target item.
+- Do not copy or lightly rewrite stored card examples.
+- The sentence must contain the target item's exact word or phrase as written in the input.
+- Use the target word or phrase exactly once when possible.
+- Keep the sentence natural, varied, and B1-B2 level.
+- Prefer 8-18 words.
+- Whenever it sounds natural, include one or two additional vocabulary items from the word bank as visible context, not as the blank.
+- Do not include the target item itself in support_words.
+- If an extra vocabulary item would make the sentence awkward, skip it.
+
+Target items:
+{target_items_json}
+
+Word bank for optional extra visible vocabulary:
+{word_bank_json}

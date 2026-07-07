@@ -38,9 +38,11 @@ If `/weak` or `/practice` is sent, the bot treats it as an unknown command and s
 
 `/today` creates a 30-task training session:
 
-- 10 fill-in-the-blank English sentences
+- 10 fresh AI-generated fill-in-the-blank English sentences
 - 10 Russian-to-English sentence translations
 - 10 own-sentence tasks
+
+Fill-in-the-blank sentences are generated for each session. Stored card examples are only card content; they are not reused as practice sentences. When natural, the generated sentence also includes one or two additional vocabulary items from the current practice word bank as visible context.
 
 The session is stored with:
 
