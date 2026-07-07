@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import difflib
 import hmac
 import html
 import json
@@ -17,53 +18,55 @@ import requests
 from botocore.exceptions import ClientError
 
 from app.config import (
+    ANSWER_FUZZY_MATCH_THRESHOLD,
     CALLBACK_CANCEL,
     CALLBACK_DELETE_CONFIRM_PREFIX,
     CALLBACK_DELETE_PREFIX,
+    CALLBACK_EDIT_PREFIX,
     CALLBACK_REGEN_PREFIX,
     CANCEL_BUTTON_TEXT,
     CANCELLED_TEXT,
     CLOZE_BLANK,
     CONFIRM_DELETE_BUTTON_TEXT,
     DELETE_BUTTON_TEXT,
+    EDIT_BUTTON_TEXT,
+    EDIT_CARD_PROMPT,
     GEMINI_TIMEOUT_MS,
     GENERIC_ERROR_TEXT,
     HELP_MENU_BUTTONS,
     HELP_TEXT,
+    LEGACY_CARD_SRS_ATTRIBUTES,
     MOCHI_API_URL,
     MOCHI_CARD_TEMPLATE,
     MOCHI_TIMEOUT_SECONDS,
-    NO_DUE_WORDS_TEXT,
-    NO_WEAK_WORDS_TEXT,
     NOT_ENOUGH_WORDS_TEXT,
-    PRACTICE_MENU_BUTTONS,
-    PRACTICE_MENU_TEXT,
-    PRACTICE_MODE_CLOZE,
-    PRACTICE_MODE_EN_RU,
-    PRACTICE_MODE_RU_EN,
-    PRACTICE_MODE_WRITE_SENTENCE,
-    PRACTICE_MODES,
+    PRACTICE_CORRECT_INTERVAL_STEPS,
+    PRACTICE_MAX_PRIORITY_SCORE,
+    PRACTICE_BLOCK_QUESTION_COUNT,
+    PRACTICE_MODE_TODAY,
     PRACTICE_QUESTION_COUNT,
     PRACTICE_SCAN_LIMIT,
     PRACTICE_SESSION_TTL_SECONDS,
-    PRACTICE_SOURCE_DUE,
-    PRACTICE_SOURCE_RANDOM,
-    PRACTICE_SOURCE_WEAK,
+    PRACTICE_SESSION_TYPE_ACTIVE,
+    PRACTICE_SESSION_TYPE_EDIT,
     REGENERATE_BUTTON_TEXT,
     RESULT_CORRECT,
+    RESULT_MINOR_ISSUE,
     RESULT_WRONG,
     SESSION_STATUS_ACTIVE,
-    SRS_INTERVALS_BY_STREAK,
-    SRS_MAX_INTERVAL_DAYS,
     STATS_SCAN_LIMIT,
     STATUS_CREATED,
     STATUS_FAILED,
     STATUS_RESERVED,
+    TASK_TYPE_FILL_BLANK,
+    TASK_TYPE_OWN_SENTENCE,
+    TASK_TYPE_TRANSLATE_RU_EN,
+    TELEGRAM_BOT_COMMANDS,
+    TODAY_PRACTICE_INTRO,
     TELEGRAM_API_BASE,
     TELEGRAM_CALLBACK_DATA_MAX_BYTES,
     TELEGRAM_TIMEOUT_SECONDS,
     USAGE_ALIASES,
-    WEAK_CORRECT_RATE_THRESHOLD,
     WORD_NOT_FOUND_TEXT,
     get_app_config,
     get_known_words_table_name,
@@ -107,6 +110,7 @@ class CardInput:
     translation: str
     usage: str
     example: str
+    cloze_sentence: str | None = None
 
 
 @dataclass(frozen=True)
@@ -129,7 +133,7 @@ class AddCardResult:
 
 @dataclass(frozen=True)
 class TelegramCommand:
-    mode: str  # "manual" | "ai" | "help" | "practice_menu" | "practice_today" | "practice_weak" | "stats"
+    mode: str  # "manual" | "ai" | "help" | "practice_today" | "stats" | "cancel"
     card: CardInput | None = None
     query: str | None = None
 
@@ -220,6 +224,19 @@ def require_string_field(data: dict[str, Any], field_name: str) -> str:
     return value.strip()
 
 
+def optional_string_field(data: dict[str, Any], field_name: str) -> str | None:
+    value = data.get(field_name)
+
+    if value is None:
+        return None
+
+    if not isinstance(value, str):
+        raise HttpError(400, f"Field '{field_name}' must be a string")
+
+    value = value.strip()
+    return value or None
+
+
 # ---------------------------------------------------------------------------
 # Normalization helpers
 # ---------------------------------------------------------------------------
@@ -235,12 +252,34 @@ def normalize_word_for_lookup(value: str) -> str:
     return " ".join(normalized.split())
 
 
+def sentence_has_exact_word(word: str, sentence: str) -> bool:
+    if not word or not sentence:
+        return False
+
+    pattern = rf"(?<!\w){re.escape(word)}(?!\w)"
+    return re.search(pattern, sentence, flags=re.IGNORECASE) is not None
+
+
+def infer_cloze_sentence(card: CardInput) -> str | None:
+    if card.cloze_sentence and sentence_has_exact_word(card.word, card.cloze_sentence):
+        return card.cloze_sentence
+
+    if sentence_has_exact_word(card.word, card.example):
+        return card.example
+
+    return None
+
+
 def build_word_key(*, deck_id: str, normalized_word: str) -> str:
     return f"deck#{deck_id}#word#{normalized_word}"
 
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def remove_expression_for(attributes: tuple[str, ...]) -> str:
+    return " REMOVE " + ", ".join(attributes)
 
 
 # ---------------------------------------------------------------------------
@@ -272,6 +311,7 @@ def reserve_known_word(
     word: str,
     translation: str,
     example: str,
+    cloze_sentence: str | None,
     usage_tag: str,
     source: str,
     config: dict[str, str],
@@ -300,13 +340,16 @@ def reserve_known_word(
         "status": STATUS_RESERVED,
         "created_at": now,
         "updated_at": now,
-        "review_count": 0,
+        "practice_attempt_count": 0,
         "correct_count": 0,
         "wrong_count": 0,
-        "streak": 0,
-        "interval_days": 0,
-        "due_at": now,
+        "minor_issue_count": 0,
+        "practice_score": 0,
+        "practice_interval_days": 0,
+        "next_practice_at": now,
     }
+    if cloze_sentence:
+        item["cloze_sentence"] = cloze_sentence
 
     try:
         table.put_item(
@@ -510,6 +553,12 @@ def generate_card_with_ai(word_or_phrase: str, config: dict[str, str]) -> CardIn
             raise AiGenerationError(f"Gemini response is missing '{field_name}'")
         fields[field_name] = value.strip()
 
+    cloze_sentence = data.get("cloze_sentence")
+    if not isinstance(cloze_sentence, str) or not cloze_sentence.strip():
+        log_event("gemini_missing_field", field="cloze_sentence")
+        raise AiGenerationError("Gemini response is missing 'cloze_sentence'")
+    fields["cloze_sentence"] = cloze_sentence.strip()
+
     return CardInput(**fields)
 
 
@@ -568,6 +617,129 @@ def evaluate_sentence_with_gemini(
     }
 
 
+def generate_translation_tasks_with_gemini(
+    items: list[dict[str, Any]],
+    config: dict[str, str],
+) -> dict[str, dict[str, str]]:
+    """Generate sentence translation tasks keyed by word_key."""
+    if genai is None:
+        log_event("gemini_sdk_missing")
+        raise AiGenerationError("google-genai SDK is not installed")
+
+    payload = [
+        {
+            "id": str(item["word_key"]),
+            "word": str(item.get("word") or ""),
+            "translation": str(item.get("translation") or ""),
+            "example": str(item.get("example") or ""),
+        }
+        for item in items
+    ]
+
+    client = genai.Client(
+        api_key=config["GEMINI_API_KEY"],
+        http_options=genai_types.HttpOptions(timeout=GEMINI_TIMEOUT_MS),
+    )
+    prompt = load_prompt("gemini_translation_tasks").replace(
+        "{items_json}",
+        json.dumps(payload, ensure_ascii=False),
+    )
+
+    try:
+        response = client.models.generate_content(
+            model=config["GEMINI_MODEL"],
+            contents=prompt,
+            config=genai_types.GenerateContentConfig(
+                response_mime_type="application/json",
+            ),
+        )
+    except Exception as error:
+        log_event("gemini_request_error", error_type=type(error).__name__)
+        raise AiGenerationError("Gemini request failed") from error
+
+    raw_text = (response.text or "").strip()
+
+    try:
+        data = json.loads(raw_text)
+    except json.JSONDecodeError:
+        log_event("gemini_invalid_json", response_preview=raw_text[:120])
+        raise AiGenerationError("Gemini returned invalid JSON")
+
+    tasks = data.get("tasks") if isinstance(data, dict) else None
+    if not isinstance(tasks, list):
+        log_event("gemini_invalid_shape")
+        raise AiGenerationError("Gemini returned an invalid task list")
+
+    generated: dict[str, dict[str, str]] = {}
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+
+        task_id = str(task.get("id") or "")
+        russian_sentence = str(task.get("russian_sentence") or "").strip()
+        expected_english = str(task.get("expected_english") or "").strip()
+
+        if task_id and russian_sentence and expected_english:
+            generated[task_id] = {
+                "russian_sentence": russian_sentence,
+                "expected_english": expected_english,
+            }
+
+    return generated
+
+
+def evaluate_translation_with_gemini(
+    task: dict[str, Any],
+    user_answer: str,
+    config: dict[str, str],
+) -> dict[str, str]:
+    """Evaluate a sentence translation by meaning."""
+    if genai is None:
+        log_event("gemini_sdk_missing")
+        raise AiGenerationError("google-genai SDK is not installed")
+
+    client = genai.Client(
+        api_key=config["GEMINI_API_KEY"],
+        http_options=genai_types.HttpOptions(timeout=GEMINI_TIMEOUT_MS),
+    )
+    prompt = (
+        load_prompt("gemini_translation_eval")
+        .replace("{russian_sentence}", str(task.get("russian_sentence") or ""))
+        .replace("{expected_english}", str(task.get("expected_answer") or ""))
+        .replace("{word}", str(task.get("word") or ""))
+        .replace("{answer}", user_answer)
+    )
+
+    try:
+        response = client.models.generate_content(
+            model=config["GEMINI_MODEL"],
+            contents=prompt,
+            config=genai_types.GenerateContentConfig(
+                response_mime_type="application/json",
+            ),
+        )
+    except Exception as error:
+        log_event("gemini_request_error", error_type=type(error).__name__)
+        raise AiGenerationError("Gemini request failed") from error
+
+    raw_text = (response.text or "").strip()
+
+    try:
+        data = json.loads(raw_text)
+    except json.JSONDecodeError:
+        log_event("gemini_invalid_json", response_preview=raw_text[:120])
+        raise AiGenerationError("Gemini returned invalid JSON")
+
+    if not isinstance(data, dict) or data.get("result") not in ("correct", "minor_issue", "wrong"):
+        log_event("gemini_invalid_shape")
+        raise AiGenerationError("Gemini returned an invalid translation evaluation")
+
+    return {
+        "result": str(data["result"]),
+        "feedback": str(data.get("feedback") or "").strip(),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Central add-card flow
 # ---------------------------------------------------------------------------
@@ -579,11 +751,13 @@ def add_card(card: CardInput, config: dict[str, str], *, source: str = "telegram
     reserve in DynamoDB, create the Mochi card, then confirm or mark FAILED.
     """
     usage_tag = normalize_usage_tag(card.usage)
+    cloze_sentence = infer_cloze_sentence(card)
 
     reservation = reserve_known_word(
         word=card.word,
         translation=card.translation,
         example=card.example,
+        cloze_sentence=cloze_sentence,
         usage_tag=usage_tag,
         source=source,
         config=config,
@@ -657,30 +831,39 @@ def regenerate_card(normalized_word: str, config: dict[str, str]) -> AddCardResu
     word = str(item.get("word") or normalized_word)
     card = generate_card_with_ai(word, config)
     usage_tag = normalize_usage_tag(card.usage)
+    cloze_sentence = infer_cloze_sentence(card)
 
-    # DynamoDB is the source of truth: if the card is missing in Mochi
-    # (deleted there manually, or never created), recreate it.
+    # DynamoDB keeps Telegram's local index; Mochi remains the card system.
+    # If the linked Mochi card is gone, create a new one and relink it.
     mochi_card_id = str(item.get("mochi_card_id") or "")
     if not mochi_card_id or not update_mochi_card(mochi_card_id, card, usage_tag, config):
         mochi_card_id = str(create_mochi_card(card, usage_tag, config).get("id") or "")
 
+    update_expression = (
+        "SET #translation = :translation, example = :example, "
+        "usage_tag = :usage_tag, mochi_card_id = :mochi_card_id, "
+        "#status = :status, updated_at = :updated_at"
+    )
+    expression_values = {
+        ":translation": card.translation,
+        ":example": card.example,
+        ":usage_tag": usage_tag,
+        ":mochi_card_id": mochi_card_id,
+        ":status": STATUS_CREATED,
+        ":updated_at": utc_now_iso(),
+    }
+    if cloze_sentence:
+        update_expression += ", cloze_sentence = :cloze_sentence"
+        expression_values[":cloze_sentence"] = cloze_sentence
+
+    update_expression += remove_expression_for(LEGACY_CARD_SRS_ATTRIBUTES)
+
     table.update_item(
         Key={"word_key": word_key},
         # "translation" and "status" are DynamoDB reserved keywords.
-        UpdateExpression=(
-            "SET #translation = :translation, example = :example, "
-            "usage_tag = :usage_tag, mochi_card_id = :mochi_card_id, "
-            "#status = :status, updated_at = :updated_at"
-        ),
+        UpdateExpression=update_expression,
         ExpressionAttributeNames={"#translation": "translation", "#status": "status"},
-        ExpressionAttributeValues={
-            ":translation": card.translation,
-            ":example": card.example,
-            ":usage_tag": usage_tag,
-            ":mochi_card_id": mochi_card_id,
-            ":status": STATUS_CREATED,
-            ":updated_at": utc_now_iso(),
-        },
+        ExpressionAttributeValues=expression_values,
     )
 
     log_event("card_regenerated", has_mochi_card=bool(mochi_card_id))
@@ -688,6 +871,146 @@ def regenerate_card(normalized_word: str, config: dict[str, str]) -> AddCardResu
     return AddCardResult(
         created=True,
         word=word,
+        mochi_card_id=mochi_card_id or None,
+        translation=card.translation,
+        example=card.example,
+    )
+
+
+def sync_mochi_card_for_known_word(
+    existing_item: dict[str, Any],
+    card: CardInput,
+    usage_tag: str,
+    config: dict[str, str],
+) -> str:
+    mochi_card_id = str(existing_item.get("mochi_card_id") or "")
+
+    if mochi_card_id and update_mochi_card(mochi_card_id, card, usage_tag, config):
+        return mochi_card_id
+
+    return str(create_mochi_card(card, usage_tag, config).get("id") or "")
+
+
+def build_known_word_item_from_card(
+    *,
+    existing_item: dict[str, Any],
+    card: CardInput,
+    usage_tag: str,
+    mochi_card_id: str,
+    config: dict[str, str],
+) -> dict[str, Any]:
+    now = utc_now_iso()
+    normalized_word = normalize_word_for_lookup(card.word)
+    item = {
+        **existing_item,
+        "word_key": build_word_key(
+            deck_id=config["MOCHI_DECK_ID"],
+            normalized_word=normalized_word,
+        ),
+        "deck_id": config["MOCHI_DECK_ID"],
+        "normalized_word": normalized_word,
+        "word": card.word,
+        "translation": card.translation,
+        "example": card.example,
+        "usage_tag": usage_tag,
+        "mochi_card_id": mochi_card_id,
+        "status": STATUS_CREATED,
+        "updated_at": now,
+    }
+    item.setdefault("created_at", now)
+
+    cloze_sentence = infer_cloze_sentence(card)
+    if cloze_sentence:
+        item["cloze_sentence"] = cloze_sentence
+    else:
+        item.pop("cloze_sentence", None)
+
+    for old_srs_attr in LEGACY_CARD_SRS_ATTRIBUTES:
+        item.pop(old_srs_attr, None)
+
+    return item
+
+
+def update_known_word_from_edit(
+    *,
+    old_word_key: str,
+    card: CardInput,
+    config: dict[str, str],
+) -> AddCardResult:
+    table = get_known_words_table()
+    existing_item = table.get_item(Key={"word_key": old_word_key}, ConsistentRead=True).get("Item")
+
+    if not existing_item:
+        raise UserInputError(WORD_NOT_FOUND_TEXT)
+
+    usage_tag = normalize_usage_tag(card.usage)
+    new_word_key = word_key_for(card.word, config)
+
+    if new_word_key != old_word_key:
+        collision = table.get_item(Key={"word_key": new_word_key}, ConsistentRead=True).get("Item")
+        if collision:
+            raise UserInputError("A card with this word already exists.")
+
+    mochi_card_id = sync_mochi_card_for_known_word(existing_item, card, usage_tag, config)
+    item = build_known_word_item_from_card(
+        existing_item=existing_item,
+        card=card,
+        usage_tag=usage_tag,
+        mochi_card_id=mochi_card_id,
+        config=config,
+    )
+
+    if new_word_key != old_word_key:
+        table.put_item(
+            Item=item,
+            ConditionExpression="attribute_not_exists(word_key)",
+        )
+        table.delete_item(Key={"word_key": old_word_key})
+    else:
+        expression_values: dict[str, Any] = {
+            ":normalized_word": item["normalized_word"],
+            ":word": item["word"],
+            ":translation": item["translation"],
+            ":example": item["example"],
+            ":usage_tag": item["usage_tag"],
+            ":mochi_card_id": item["mochi_card_id"],
+            ":status": item["status"],
+            ":updated_at": item["updated_at"],
+        }
+        update_expression = (
+            "SET normalized_word = :normalized_word, #word = :word, "
+            "#translation = :translation, example = :example, usage_tag = :usage_tag, "
+            "mochi_card_id = :mochi_card_id, #status = :status, updated_at = :updated_at"
+        )
+
+        if "cloze_sentence" in item:
+            update_expression += ", cloze_sentence = :cloze_sentence"
+            expression_values[":cloze_sentence"] = item["cloze_sentence"]
+            remove_attrs = LEGACY_CARD_SRS_ATTRIBUTES
+        else:
+            remove_attrs = (  # also remove an invalid cloze sentence when the edit cannot support it
+                "cloze_sentence",
+                *LEGACY_CARD_SRS_ATTRIBUTES,
+            )
+
+        update_expression += remove_expression_for(remove_attrs)
+
+        table.update_item(
+            Key={"word_key": old_word_key},
+            UpdateExpression=update_expression,
+            ExpressionAttributeNames={
+                "#translation": "translation",
+                "#status": "status",
+                "#word": "word",
+            },
+            ExpressionAttributeValues=expression_values,
+        )
+
+    log_event("card_edited", word_changed=new_word_key != old_word_key, has_mochi_card=bool(mochi_card_id))
+
+    return AddCardResult(
+        created=True,
+        word=card.word,
         mochi_card_id=mochi_card_id or None,
         translation=card.translation,
         example=card.example,
@@ -762,16 +1085,33 @@ def answer_callback_query(callback_query_id: str, config: dict[str, str]) -> Non
         )
 
 
+def sync_telegram_bot_commands(config: dict[str, str]) -> dict[str, Any]:
+    response = requests.post(
+        f"{TELEGRAM_API_BASE}/bot{config['TELEGRAM_BOT_TOKEN']}/setMyCommands",
+        json={"commands": list(TELEGRAM_BOT_COMMANDS)},
+        timeout=TELEGRAM_TIMEOUT_SECONDS,
+    )
+
+    if response.status_code >= 400:
+        log_event(
+            "telegram_sync_commands_error",
+            status_code=response.status_code,
+            response_preview=response.text[:300],
+        )
+        raise HttpError(502, "Telegram command sync failed")
+
+    return {
+        "ok": True,
+        "commands": [command["command"] for command in TELEGRAM_BOT_COMMANDS],
+    }
+
+
 def build_inline_keyboard(rows: tuple) -> dict[str, Any]:
     return {
         "inline_keyboard": [
             [{"text": label, "callback_data": data} for label, data in row] for row in rows
         ]
     }
-
-
-def build_practice_menu() -> dict[str, Any]:
-    return build_inline_keyboard(PRACTICE_MENU_BUTTONS)
 
 
 def build_help_menu() -> dict[str, Any]:
@@ -790,15 +1130,17 @@ def callback_data_for(prefix: str, word: str) -> str | None:
 
 def build_card_actions_keyboard(word: str) -> dict[str, Any] | None:
     regen = callback_data_for(CALLBACK_REGEN_PREFIX, word)
+    edit = callback_data_for(CALLBACK_EDIT_PREFIX, word)
     delete = callback_data_for(CALLBACK_DELETE_PREFIX, word)
 
-    if not regen or not delete:
+    if not regen or not edit or not delete:
         return None
 
     return {
         "inline_keyboard": [
             [
                 {"text": REGENERATE_BUTTON_TEXT, "callback_data": regen},
+                {"text": EDIT_BUTTON_TEXT, "callback_data": edit},
                 {"text": DELETE_BUTTON_TEXT, "callback_data": delete},
             ]
         ]
@@ -839,10 +1181,9 @@ def parse_telegram_command(text: str) -> TelegramCommand:
       /ai word_or_phrase                         -> mode="ai"
       /delete word                               -> mode="delete"
       /help, /start                              -> mode="help"
-      /practice                                  -> mode="practice_menu"
       /today                                     -> mode="practice_today"
-      /weak                                      -> mode="practice_weak"
       /stats                                     -> mode="stats"
+      /cancel                                    -> mode="cancel"
     Anything else raises UserInputError with the format help.
     """
     text = text.strip()
@@ -853,14 +1194,11 @@ def parse_telegram_command(text: str) -> TelegramCommand:
     if command in ("/help", "/start"):
         return TelegramCommand(mode="help")
 
-    if command == "/practice":
-        return TelegramCommand(mode="practice_menu")
+    if command == "/cancel":
+        return TelegramCommand(mode="cancel")
 
     if command == "/today":
         return TelegramCommand(mode="practice_today")
-
-    if command == "/weak":
-        return TelegramCommand(mode="practice_weak")
 
     if command == "/stats":
         return TelegramCommand(mode="stats")
@@ -924,30 +1262,29 @@ def process_telegram_text(
     """Returns (reply_text, reply_markup or None)."""
     stripped = text.strip()
 
-    # Plain text while a practice session is active is the session answer.
-    if not stripped.startswith("/"):
-        session = get_active_practice_session(telegram_user_id)
-        if session:
-            return handle_practice_answer(session, stripped, config), None
+    session = get_active_session(telegram_user_id)
+    if session and stripped.lower() == "/cancel":
+        clear_session(telegram_user_id)
+        return CANCELLED_TEXT, None
+
+    # Plain text while a session is active is either a practice answer or edit payload.
+    if session and not stripped.startswith("/"):
+        if session.get("session_type") == PRACTICE_SESSION_TYPE_EDIT:
+            return handle_edit_card_answer(session, stripped, config)
+        return handle_practice_answer(session, stripped, config), None
 
     command = parse_telegram_command(stripped)
     log_event("telegram_command", mode=command.mode)
 
+    if command.mode == "cancel":
+        clear_session(telegram_user_id)
+        return CANCELLED_TEXT, None
+
     if command.mode == "help":
         return HELP_TEXT, build_help_menu()
 
-    if command.mode == "practice_menu":
-        return PRACTICE_MENU_TEXT, build_practice_menu()
-
     if command.mode == "practice_today":
-        return start_practice_session(
-            telegram_user_id, PRACTICE_MODE_EN_RU, source=PRACTICE_SOURCE_DUE
-        ), None
-
-    if command.mode == "practice_weak":
-        return start_practice_session(
-            telegram_user_id, PRACTICE_MODE_EN_RU, source=PRACTICE_SOURCE_WEAK
-        ), None
+        return start_today_practice_session(telegram_user_id, config), None
 
     if command.mode == "stats":
         return build_stats_reply(), None
@@ -962,86 +1299,318 @@ def process_telegram_text(
 
 
 # ---------------------------------------------------------------------------
-# Practice: word selection
+# Active practice: word selection
 # ---------------------------------------------------------------------------
+
+
+def scan_known_word_items(limit: int = PRACTICE_SCAN_LIMIT) -> list[dict[str, Any]]:
+    """Scan is fine here: small personal table (see project constraints)."""
+    table = get_known_words_table()
+    items: list[dict[str, Any]] = []
+    last_evaluated_key = None
+
+    while True:
+        scan_kwargs: dict[str, Any] = {}
+
+        if limit:
+            remaining = limit - len(items)
+            if remaining <= 0:
+                log_event("practice_scan_capped", limit=limit)
+                break
+            scan_kwargs["Limit"] = remaining
+
+        if last_evaluated_key:
+            scan_kwargs["ExclusiveStartKey"] = last_evaluated_key
+
+        response = table.scan(**scan_kwargs)
+        items.extend(response.get("Items") or [])
+        last_evaluated_key = response.get("LastEvaluatedKey")
+
+        if not last_evaluated_key:
+            break
+
+    return items
 
 
 def get_known_words_for_practice(limit: int = PRACTICE_SCAN_LIMIT) -> list[dict[str, Any]]:
-    """Scan is fine here: small personal table (see project constraints)."""
-    response = get_known_words_table().scan(Limit=limit)
-    items = response.get("Items") or []
-    return [item for item in items if item.get("status") == STATUS_CREATED]
+    return [item for item in scan_known_word_items(limit=limit) if item.get("status") == STATUS_CREATED]
 
 
-def is_due_word(item: dict[str, Any], now_iso: str) -> bool:
-    due_at = item.get("due_at")
-    return not due_at or str(due_at) <= now_iso
-
-
-def is_weak_word(item: dict[str, Any]) -> bool:
-    if item.get("last_result") == RESULT_WRONG:
-        return True
-
-    if int(item.get("wrong_count") or 0) > 0:
-        return True
-
-    review_count = int(item.get("review_count") or 0)
-    correct_count = int(item.get("correct_count") or 0)
-    return review_count > 0 and correct_count / review_count < WEAK_CORRECT_RATE_THRESHOLD
-
-
-def get_due_words(limit: int = PRACTICE_QUESTION_COUNT) -> list[dict[str, Any]]:
-    now_iso = utc_now_iso()
-    due = [item for item in get_known_words_for_practice() if is_due_word(item, now_iso)]
-    return due[:limit]
-
-
-def get_weak_words(limit: int = PRACTICE_QUESTION_COUNT) -> list[dict[str, Any]]:
-    weak = [item for item in get_known_words_for_practice() if is_weak_word(item)]
-    return weak[:limit]
-
-
-def build_cloze_sentence(word: str, example: str) -> str | None:
-    """Blank the target word out of its example; None when it cannot be blanked."""
-    if not word or not example:
+def build_cloze_sentence(
+    word: str,
+    example: str,
+    cloze_sentence: str | None = None,
+) -> str | None:
+    """Blank the target word out of its cloze sentence or example."""
+    if not word:
         return None
 
-    blanked, count = re.subn(re.escape(word), CLOZE_BLANK, example, flags=re.IGNORECASE)
-    return blanked if count else None
+    pattern = rf"(?<!\w){re.escape(word)}(?!\w)"
+
+    for sentence in (cloze_sentence, example):
+        if not sentence:
+            continue
+
+        blanked, count = re.subn(pattern, CLOZE_BLANK, sentence, flags=re.IGNORECASE)
+        if count:
+            return blanked
+
+    return None
 
 
-def word_fits_mode(item: dict[str, Any], mode: str) -> bool:
-    if not item.get("word"):
+def word_fits_active_practice(item: dict[str, Any]) -> bool:
+    word = str(item.get("word") or "")
+    return bool(word and item.get("translation"))
+
+
+def word_fits_blank_practice(item: dict[str, Any]) -> bool:
+    if not word_fits_active_practice(item):
         return False
 
-    if mode in (PRACTICE_MODE_EN_RU, PRACTICE_MODE_RU_EN):
-        return bool(item.get("translation"))
-
-    if mode == PRACTICE_MODE_CLOZE:
-        return build_cloze_sentence(str(item.get("word")), str(item.get("example") or "")) is not None
-
-    return True  # write_sentence needs only the word
+    return build_cloze_sentence(
+        str(item.get("word") or ""),
+        str(item.get("example") or ""),
+        str(item.get("cloze_sentence") or ""),
+    ) is not None
 
 
-def choose_practice_words(
-    mode: str,
-    source: str,
-    limit: int = PRACTICE_QUESTION_COUNT,
-) -> list[dict[str, Any]]:
-    if source == PRACTICE_SOURCE_DUE:
-        words = get_due_words(limit=PRACTICE_SCAN_LIMIT)
-    elif source == PRACTICE_SOURCE_WEAK:
-        words = get_weak_words(limit=PRACTICE_SCAN_LIMIT)
+def parse_iso_datetime(value: Any) -> datetime | None:
+    if not value:
+        return None
+
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+
+    return parsed
+
+
+def practice_candidate_score(item: dict[str, Any], now: datetime) -> float:
+    correct_count = int(item.get("correct_count") or 0)
+    wrong_count = int(item.get("wrong_count") or 0)
+    minor_issue_count = int(item.get("minor_issue_count") or 0)
+    practice_score = int(item.get("practice_score") or 0)
+    last_practiced_at = parse_iso_datetime(item.get("last_practiced_at"))
+    next_practice_at = parse_iso_datetime(item.get("next_practice_at"))
+
+    score = random.random()
+    score += wrong_count * 3
+    score += minor_issue_count * 2
+    score += practice_score * 2
+    score -= correct_count * 0.4
+
+    if not last_practiced_at:
+        score += 5
     else:
-        words = get_known_words_for_practice()
+        hours_since_practice = max((now - last_practiced_at).total_seconds() / 3600, 0)
+        if hours_since_practice < 24:
+            score -= 5
+        else:
+            score += min(hours_since_practice / 24, 7) * 0.5
 
-    words = [item for item in words if word_fits_mode(item, mode)]
-    random.shuffle(words)
-    return words[:limit]
+    if not next_practice_at:
+        score += 4
+    elif next_practice_at <= now:
+        days_ready = max((now - next_practice_at).total_seconds() / 86400, 0)
+        score += 4 + min(days_ready, 7)
+    else:
+        hours_until_ready = max((next_practice_at - now).total_seconds() / 3600, 0)
+        score -= min(hours_until_ready / 24, 5)
+
+    return score
+
+
+def choose_practice_block(
+    candidates: list[dict[str, Any]],
+    limit: int,
+    *,
+    excluded_word_keys: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    excluded_word_keys = excluded_word_keys or set()
+    now = datetime.now(timezone.utc)
+    available = [
+        item for item in candidates if str(item.get("word_key") or "") not in excluded_word_keys
+    ]
+    ranked = sorted(
+        available,
+        key=lambda item: practice_candidate_score(item, now),
+        reverse=True,
+    )
+    return ranked[:limit]
+
+
+def build_today_practice_questions(words: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    questions = []
+
+    for item in words:
+        word = str(item.get("word") or "")
+        translation = str(item.get("translation") or "")
+        blanked = build_cloze_sentence(
+            word,
+            str(item.get("example") or ""),
+            str(item.get("cloze_sentence") or ""),
+        )
+
+        if not blanked:
+            continue
+
+        questions.append(
+            {
+                "task_type": TASK_TYPE_FILL_BLANK,
+                "linked_word_keys": [item["word_key"]],
+                "word": word,
+                "translation": translation,
+                "prompt": f"{blanked} ({translation})",
+                "expected_answer": word,
+                "acceptable_answers": [word],
+            }
+        )
+
+    return questions
+
+
+def build_translation_practice_questions(
+    words: list[dict[str, Any]],
+    config: dict[str, str],
+) -> list[dict[str, Any]]:
+    generated_tasks = generate_translation_tasks_with_gemini(words, config)
+    questions = []
+    for item in words:
+        word_key = str(item["word_key"])
+        word = str(item.get("word") or "")
+        generated = generated_tasks.get(word_key)
+        if not generated:
+            raise AiGenerationError("Gemini did not generate all translation tasks")
+
+        russian_sentence = generated["russian_sentence"]
+        expected_english = generated["expected_english"]
+
+        questions.append(
+            {
+                "task_type": TASK_TYPE_TRANSLATE_RU_EN,
+                "linked_word_keys": [word_key],
+                "word": word,
+                "translation": str(item.get("translation") or ""),
+                "russian_sentence": russian_sentence,
+                "prompt": f"Переведи на английский:\n{russian_sentence}",
+                "expected_answer": expected_english,
+                "acceptable_answers": [expected_english],
+            }
+        )
+
+    return questions
+
+
+def build_own_sentence_practice_questions(words: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "task_type": TASK_TYPE_OWN_SENTENCE,
+            "linked_word_keys": [item["word_key"]],
+            "word": str(item.get("word") or ""),
+            "translation": str(item.get("translation") or ""),
+            "prompt": f"Напиши свое предложение со словом/фразой: {item.get('word')}",
+            "expected_answer": str(item.get("word") or ""),
+            "acceptable_answers": [str(item.get("word") or "")],
+        }
+        for item in words
+    ]
+
+
+def build_task_prompt(task: dict[str, Any], task_number: int, total_tasks: int) -> str:
+    task_type = task.get("task_type")
+    title_by_type = {
+        TASK_TYPE_FILL_BLANK: "Fill in the blank:",
+        TASK_TYPE_TRANSLATE_RU_EN: "Translation:",
+        TASK_TYPE_OWN_SENTENCE: "Own sentence:",
+    }
+    title = title_by_type.get(str(task_type), "Practice:")
+
+    return "\n".join(
+        [
+            f"Task {task_number}/{total_tasks}",
+            title,
+            "",
+            html.escape(str(task.get("prompt") or "")),
+        ]
+    )
+
+
+def build_today_practice_tasks(config: dict[str, str]) -> list[dict[str, Any]]:
+    words = [item for item in get_known_words_for_practice() if word_fits_active_practice(item)]
+    blank_candidates = [item for item in words if word_fits_blank_practice(item)]
+    used_word_keys: set[str] = set()
+
+    blank_words = choose_practice_block(
+        blank_candidates,
+        PRACTICE_BLOCK_QUESTION_COUNT,
+        excluded_word_keys=used_word_keys,
+    )
+    used_word_keys.update(str(item["word_key"]) for item in blank_words)
+
+    translation_words = choose_practice_block(
+        words,
+        PRACTICE_BLOCK_QUESTION_COUNT,
+        excluded_word_keys=used_word_keys,
+    )
+    used_word_keys.update(str(item["word_key"]) for item in translation_words)
+
+    own_sentence_words = choose_practice_block(
+        words,
+        PRACTICE_BLOCK_QUESTION_COUNT,
+        excluded_word_keys=used_word_keys,
+    )
+
+    if (
+        len(blank_words) < PRACTICE_BLOCK_QUESTION_COUNT
+        or len(translation_words) < PRACTICE_BLOCK_QUESTION_COUNT
+        or len(own_sentence_words) < PRACTICE_BLOCK_QUESTION_COUNT
+    ):
+        return []
+
+    tasks = []
+    tasks.extend(build_today_practice_questions(blank_words))
+    tasks.extend(build_translation_practice_questions(translation_words, config))
+    tasks.extend(build_own_sentence_practice_questions(own_sentence_words))
+    return tasks
+
+
+def start_today_practice_session(telegram_user_id: str, config: dict[str, str]) -> str:
+    tasks = build_today_practice_tasks(config)
+
+    if len(tasks) < PRACTICE_QUESTION_COUNT:
+        return NOT_ENOUGH_WORDS_TEXT
+
+    session = {
+        "telegram_user_id": str(telegram_user_id),
+        "user_id": str(telegram_user_id),
+        "training_id": f"{telegram_user_id}:{int(time.time())}",
+        "session_type": PRACTICE_SESSION_TYPE_ACTIVE,
+        "mode": PRACTICE_MODE_TODAY,
+        "tasks": tasks,
+        "current_task_index": 0,
+        "user_answers": [],
+        "evaluation_results": [],
+        "created_at": utc_now_iso(),
+        "expires_at": int(time.time()) + PRACTICE_SESSION_TTL_SECONDS,
+        "status": SESSION_STATUS_ACTIVE,
+    }
+    save_session(str(telegram_user_id), session)
+
+    log_event("active_practice_started", mode=PRACTICE_MODE_TODAY, tasks=len(tasks))
+    return "\n\n".join(
+        [
+            TODAY_PRACTICE_INTRO,
+            build_task_prompt(tasks[0], 1, len(tasks)),
+        ]
+    )
 
 
 # ---------------------------------------------------------------------------
-# Practice: sessions
+# Sessions
 # ---------------------------------------------------------------------------
 
 
@@ -1049,11 +1618,11 @@ def get_practice_sessions_table():
     return boto3.resource("dynamodb").Table(get_practice_sessions_table_name())
 
 
-def save_practice_session(telegram_user_id: str, session: dict[str, Any]) -> None:
+def save_session(telegram_user_id: str, session: dict[str, Any]) -> None:
     get_practice_sessions_table().put_item(Item=session)
 
 
-def get_active_practice_session(telegram_user_id: str) -> dict[str, Any] | None:
+def get_active_session(telegram_user_id: str) -> dict[str, Any] | None:
     item = (
         get_practice_sessions_table()
         .get_item(Key={"telegram_user_id": str(telegram_user_id)}, ConsistentRead=True)
@@ -1070,249 +1639,219 @@ def get_active_practice_session(telegram_user_id: str) -> dict[str, Any] | None:
     return item
 
 
-def clear_practice_session(telegram_user_id: str) -> None:
+def clear_session(telegram_user_id: str) -> None:
     get_practice_sessions_table().delete_item(Key={"telegram_user_id": str(telegram_user_id)})
 
 
-def build_practice_questions(mode: str, words: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    questions = []
-
-    for item in words:
-        word = str(item.get("word") or "")
-        translation = str(item.get("translation") or "")
-        example = str(item.get("example") or "")
-
-        if mode == PRACTICE_MODE_EN_RU:
-            prompt, expected = word, translation
-        elif mode == PRACTICE_MODE_RU_EN:
-            prompt, expected = translation, word
-        elif mode == PRACTICE_MODE_CLOZE:
-            blanked = build_cloze_sentence(word, example)
-            if not blanked:
-                continue
-            prompt, expected = blanked, word
-        else:  # write_sentence
-            prompt, expected = word, ""
-
-        questions.append(
-            {
-                "word_key": item["word_key"],
-                "word": word,
-                "translation": translation,
-                "example": example,
-                "prompt": prompt,
-                "expected_answer": expected,
-            }
-        )
-
-    return questions
-
-
-def build_practice_prompt(mode: str, questions: list[dict[str, Any]]) -> str:
-    if mode == PRACTICE_MODE_WRITE_SENTENCE:
-        return f"Write your own sentence with:\n\n<b>{html.escape(questions[0]['word'])}</b>"
-
-    headers = {
-        PRACTICE_MODE_EN_RU: "Translate to Russian:",
-        PRACTICE_MODE_RU_EN: "Translate to English:",
-        PRACTICE_MODE_CLOZE: "Fill in the blanks:",
-    }
-    lines = [headers[mode], ""]
-    lines += [f"{number}. {html.escape(q['prompt'])}" for number, q in enumerate(questions, 1)]
-    return "\n".join(lines)
-
-
-def start_practice_session(
-    telegram_user_id: str,
-    mode: str,
-    *,
-    source: str = PRACTICE_SOURCE_RANDOM,
-) -> str:
-    """Create and save a session, returning the message to send to the chat."""
-    limit = 1 if mode == PRACTICE_MODE_WRITE_SENTENCE else PRACTICE_QUESTION_COUNT
-    words = choose_practice_words(mode, source, limit=limit)
-    questions = build_practice_questions(mode, words)
-
-    if not questions:
-        if source == PRACTICE_SOURCE_DUE:
-            return NO_DUE_WORDS_TEXT
-        if source == PRACTICE_SOURCE_WEAK:
-            return NO_WEAK_WORDS_TEXT
-        return NOT_ENOUGH_WORDS_TEXT
-
-    session = {
-        "telegram_user_id": str(telegram_user_id),
-        "mode": mode,
-        "questions": questions,
-        "created_at": utc_now_iso(),
-        "expires_at": int(time.time()) + PRACTICE_SESSION_TTL_SECONDS,
-        "status": SESSION_STATUS_ACTIVE,
-    }
-    save_practice_session(str(telegram_user_id), session)
-
-    log_event("practice_session_started", mode=mode, source=source, questions=len(questions))
-    return build_practice_prompt(mode, questions)
-
-
 # ---------------------------------------------------------------------------
-# Practice: spaced repetition
+# Active practice: scoring
 # ---------------------------------------------------------------------------
 
 
-def calculate_next_review(is_correct: bool, current_streak: int) -> tuple[int, int]:
-    """Returns (new_streak, interval_days)."""
-    if not is_correct:
-        return 0, 1
+def next_correct_interval(current_interval_days: int) -> int:
+    for interval_days in PRACTICE_CORRECT_INTERVAL_STEPS:
+        if current_interval_days < interval_days:
+            return interval_days
 
-    streak = current_streak + 1
-    return streak, SRS_INTERVALS_BY_STREAK.get(streak, SRS_MAX_INTERVAL_DAYS)
+    return PRACTICE_CORRECT_INTERVAL_STEPS[-1]
 
 
-def update_word_review_stats(word_key: str, is_correct: bool) -> None:
+def calculate_next_active_practice(
+    result: str,
+    current_score: int,
+    current_interval_days: int,
+) -> tuple[int, int]:
+    if result == RESULT_CORRECT:
+        practice_score = max(current_score - 1, 0)
+        interval_days = next_correct_interval(current_interval_days)
+    elif result == RESULT_MINOR_ISSUE:
+        practice_score = min(current_score + 1, PRACTICE_MAX_PRIORITY_SCORE)
+        interval_days = min(max(current_interval_days, 1), 3)
+    else:
+        practice_score = min(current_score + 2, PRACTICE_MAX_PRIORITY_SCORE)
+        interval_days = 0
+
+    return practice_score, interval_days
+
+
+def update_word_practice_stats(word_key: str, result: str) -> None:
     table = get_known_words_table()
     item = table.get_item(Key={"word_key": word_key}).get("Item") or {}
-    streak, interval_days = calculate_next_review(is_correct, int(item.get("streak") or 0))
+    practice_score, interval_days = calculate_next_active_practice(
+        result,
+        int(item.get("practice_score") or 0),
+        int(item.get("practice_interval_days") or 0),
+    )
     now = datetime.now(timezone.utc)
+    set_parts = [
+        "practice_attempt_count = if_not_exists(practice_attempt_count, :zero) + :one",
+        "last_practiced_at = :now",
+        "last_practice_result = :result",
+        "practice_score = :practice_score",
+        "practice_interval_days = :interval",
+        "next_practice_at = :next_practice_at",
+        "updated_at = :now",
+    ]
+    expression_values = {
+        ":zero": 0,
+        ":one": 1,
+        ":now": now.isoformat(),
+        ":result": result,
+        ":practice_score": practice_score,
+        ":interval": interval_days,
+        ":next_practice_at": (now + timedelta(days=interval_days)).isoformat(),
+    }
+
+    if result == RESULT_CORRECT:
+        set_parts.append("correct_count = if_not_exists(correct_count, :zero) + :one")
+        set_parts.append("last_correct_at = :now")
+    elif result == RESULT_MINOR_ISSUE:
+        set_parts.append("minor_issue_count = if_not_exists(minor_issue_count, :zero) + :one")
+    else:
+        set_parts.append("wrong_count = if_not_exists(wrong_count, :zero) + :one")
+        set_parts.append("last_wrong_at = :now")
 
     table.update_item(
         Key={"word_key": word_key},
-        UpdateExpression=(
-            "SET review_count = if_not_exists(review_count, :zero) + :one, "
-            "correct_count = if_not_exists(correct_count, :zero) + :correct, "
-            "wrong_count = if_not_exists(wrong_count, :zero) + :wrong, "
-            "last_reviewed_at = :now, last_result = :result, "
-            "streak = :streak, interval_days = :interval, "
-            "due_at = :due_at, updated_at = :now"
-        ),
-        ExpressionAttributeValues={
-            ":zero": 0,
-            ":one": 1,
-            ":correct": 1 if is_correct else 0,
-            ":wrong": 0 if is_correct else 1,
-            ":now": now.isoformat(),
-            ":result": RESULT_CORRECT if is_correct else RESULT_WRONG,
-            ":streak": streak,
-            ":interval": interval_days,
-            ":due_at": (now + timedelta(days=interval_days)).isoformat(),
-        },
+        UpdateExpression="SET " + ", ".join(set_parts) + remove_expression_for(LEGACY_CARD_SRS_ATTRIBUTES),
+        ExpressionAttributeValues=expression_values,
     )
 
 
 # ---------------------------------------------------------------------------
-# Practice: answer evaluation
+# Active practice: answer evaluation
 # ---------------------------------------------------------------------------
-
-NUMBERED_ANSWER_RE = re.compile(r"^\s*(\d{1,2})\s*[.):\-]?\s+(.+)$")
-
-
-def parse_numbered_answers(text: str) -> dict[int, str]:
-    """
-    Parse '1. ответ' / '2) ответ' style lines. When no line is numbered,
-    non-empty lines are taken in order as answers 1..N.
-    """
-    numbered: dict[int, str] = {}
-    plain: list[str] = []
-
-    for line in text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-
-        match = NUMBERED_ANSWER_RE.match(line)
-        if match:
-            numbered[int(match.group(1))] = match.group(2).strip()
-        else:
-            plain.append(line)
-
-    if numbered:
-        return numbered
-
-    return {number: line for number, line in enumerate(plain, 1)}
 
 
 def normalize_answer(value: str) -> str:
-    return value.strip().strip(".,!?;:'\"()«»—–-").strip().lower()
+    value = unicodedata.normalize("NFKC", value)
+    value = value.strip().strip(".,!?;:'\"()«»—–-").strip().lower()
+    return " ".join(value.split())
 
 
-def answer_matches(expected: str, answer: str, *, allow_substring: bool) -> bool:
-    expected_norm = normalize_answer(expected)
+def answer_matches(expected: str, answer: str) -> bool:
+    return answer_match_result(expected, answer) in (RESULT_CORRECT, RESULT_MINOR_ISSUE)
+
+
+def answer_match_result(expected: str, answer: str) -> str:
     answer_norm = normalize_answer(answer)
+    expected_options = []
 
-    if not answer_norm or not expected_norm:
-        return False
+    for option in expected.split(","):
+        option_norm = normalize_answer(option)
+        if option_norm:
+            expected_options.append(option_norm)
 
-    if answer_norm == expected_norm:
-        return True
+    if not answer_norm or not expected_options:
+        return RESULT_WRONG
 
-    # Stored translations may hold several options ("надежный, достоверный").
-    return allow_substring and (answer_norm in expected_norm or expected_norm in answer_norm)
+    if any(answer_norm == option for option in expected_options):
+        return RESULT_CORRECT
 
+    if any(
+        difflib.SequenceMatcher(None, answer_norm, option).ratio()
+        >= ANSWER_FUZZY_MATCH_THRESHOLD
+        for option in expected_options
+    ):
+        return RESULT_MINOR_ISSUE
 
-def evaluate_numbered_answers(
-    session: dict[str, Any],
-    user_text: str,
-    *,
-    allow_substring: bool,
-) -> str:
-    questions = session.get("questions") or []
-    answers = parse_numbered_answers(user_text)
-
-    lines = []
-    correct = 0
-
-    for number, question in enumerate(questions, 1):
-        answer = answers.get(number, "")
-        expected = str(question.get("expected_answer") or "")
-        is_correct = answer_matches(expected, answer, allow_substring=allow_substring)
-        update_word_review_stats(str(question["word_key"]), is_correct)
-
-        if is_correct:
-            correct += 1
-            lines.append(f"{number}. ✓ {html.escape(expected)}")
-        else:
-            given = html.escape(answer) if answer else "no answer"
-            lines.append(f"{number}. ✗ {given} (correct: {html.escape(expected)})")
-
-    lines.append("")
-    lines.append(f"Score: {correct}/{len(questions)}")
-    return "\n".join(lines)
+    return RESULT_WRONG
 
 
-def evaluate_translation_answers(session: dict[str, Any], user_text: str) -> str:
-    # Substring matching only helps when the expected answer is a Russian
-    # translation with several comma-separated options (EN → RU).
-    allow_substring = session.get("mode") == PRACTICE_MODE_EN_RU
-    return evaluate_numbered_answers(session, user_text, allow_substring=allow_substring)
-
-
-def evaluate_cloze_answers(session: dict[str, Any], user_text: str) -> str:
-    return evaluate_numbered_answers(session, user_text, allow_substring=False)
-
-
-def evaluate_sentence_answer(
-    session: dict[str, Any],
-    user_text: str,
-    config: dict[str, str],
-) -> str:
-    question = (session.get("questions") or [{}])[0]
-    evaluation = evaluate_sentence_with_gemini(str(question.get("word") or ""), user_text, config)
-
-    result = evaluation["result"]
-    is_correct = result in ("good", "minor_issue")
-    update_word_review_stats(str(question["word_key"]), is_correct)
-
-    lines = []
-    if result == "good":
-        lines.append("Good sentence.")
-    elif result == "minor_issue":
-        lines.append("Minor issue.")
+def evaluate_fill_blank_answer(task: dict[str, Any], user_answer: str) -> dict[str, str]:
+    result = answer_match_result(str(task.get("expected_answer") or ""), user_answer)
+    if result == RESULT_CORRECT:
+        feedback = "Correct."
+    elif result == RESULT_MINOR_ISSUE:
+        feedback = f"Minor issue. Expected: {task.get('expected_answer')}"
     else:
-        lines.append("Wrong usage.")
+        feedback = f"Wrong. Correct: {task.get('expected_answer')}"
 
-    if evaluation["feedback"]:
-        lines.append(html.escape(evaluation["feedback"]))
-    if result != "good" and evaluation["better_sentence"]:
-        lines.append(f"Better: {html.escape(evaluation['better_sentence'])}")
+    return {"result": result, "feedback": feedback}
+
+
+def evaluate_own_sentence_answer(
+    task: dict[str, Any],
+    user_answer: str,
+    config: dict[str, str],
+) -> dict[str, str]:
+    evaluation = evaluate_sentence_with_gemini(str(task.get("word") or ""), user_answer, config)
+    result_map = {
+        "good": RESULT_CORRECT,
+        "minor_issue": RESULT_MINOR_ISSUE,
+        "wrong_usage": RESULT_WRONG,
+    }
+    feedback = evaluation.get("feedback") or ""
+    if evaluation["result"] != "good" and evaluation.get("better_sentence"):
+        feedback = f"{feedback} Better: {evaluation['better_sentence']}".strip()
+
+    return {
+        "result": result_map[evaluation["result"]],
+        "feedback": feedback or evaluation["result"],
+    }
+
+
+def evaluate_training_task(
+    task: dict[str, Any],
+    user_answer: str,
+    config: dict[str, str],
+) -> dict[str, str]:
+    task_type = task.get("task_type")
+
+    if task_type == TASK_TYPE_FILL_BLANK:
+        return evaluate_fill_blank_answer(task, user_answer)
+
+    if task_type == TASK_TYPE_TRANSLATE_RU_EN:
+        return evaluate_translation_with_gemini(task, user_answer, config)
+
+    if task_type == TASK_TYPE_OWN_SENTENCE:
+        return evaluate_own_sentence_answer(task, user_answer, config)
+
+    raise UserInputError("Unknown practice task.")
+
+
+def result_label(result: str) -> str:
+    if result == RESULT_CORRECT:
+        return "Correct"
+    if result == RESULT_MINOR_ISSUE:
+        return "Minor issue"
+    return "Wrong"
+
+
+def update_practice_stats_for_task(task: dict[str, Any], result: str) -> None:
+    for word_key in task.get("linked_word_keys") or []:
+        update_word_practice_stats(str(word_key), result)
+
+
+def build_training_summary(session: dict[str, Any]) -> str:
+    results = session.get("evaluation_results") or []
+    tasks = session.get("tasks") or []
+    correct = sum(1 for item in results if item.get("result") == RESULT_CORRECT)
+    minor = sum(1 for item in results if item.get("result") == RESULT_MINOR_ISSUE)
+    wrong = sum(1 for item in results if item.get("result") == RESULT_WRONG)
+
+    practice_again = []
+    for result in results:
+        if result.get("result") == RESULT_CORRECT:
+            continue
+
+        task_index = int(result.get("task_index") or 0)
+        if 0 <= task_index < len(tasks):
+            word = str(tasks[task_index].get("word") or "")
+            if word and word not in practice_again:
+                practice_again.append(word)
+
+    lines = [
+        "Готово.",
+        "",
+        f"Correct: {correct}",
+        f"Minor issues: {minor}",
+        f"Wrong: {wrong}",
+    ]
+
+    if practice_again:
+        lines += ["", "Слова, которые стоит потренировать еще:"]
+        lines += [f"- {html.escape(word)}" for word in practice_again]
 
     return "\n".join(lines)
 
@@ -1322,39 +1861,237 @@ def handle_practice_answer(
     user_text: str,
     config: dict[str, str],
 ) -> str:
-    mode = session.get("mode")
+    tasks = session.get("tasks") or []
+    current_task_index = int(session.get("current_task_index") or 0)
 
-    if mode == PRACTICE_MODE_WRITE_SENTENCE:
-        reply = evaluate_sentence_answer(session, user_text, config)
-    elif mode == PRACTICE_MODE_CLOZE:
-        reply = evaluate_cloze_answers(session, user_text)
-    else:
-        reply = evaluate_translation_answers(session, user_text)
+    if current_task_index >= len(tasks):
+        clear_session(str(session["telegram_user_id"]))
+        return build_training_summary(session)
 
-    # Cleared only after successful evaluation so the user can retry on errors.
-    clear_practice_session(str(session["telegram_user_id"]))
-    return reply
+    task = tasks[current_task_index]
+    evaluation = evaluate_training_task(task, user_text, config)
+    result = evaluation["result"]
+    update_practice_stats_for_task(task, result)
+
+    user_answers = list(session.get("user_answers") or [])
+    evaluation_results = list(session.get("evaluation_results") or [])
+    user_answers.append(
+        {
+            "task_index": current_task_index,
+            "answer": user_text,
+            "answered_at": utc_now_iso(),
+        }
+    )
+    evaluation_results.append(
+        {
+            "task_index": current_task_index,
+            "task_type": task.get("task_type"),
+            "result": result,
+            "feedback": evaluation.get("feedback") or "",
+            "evaluated_at": utc_now_iso(),
+        }
+    )
+
+    next_task_index = current_task_index + 1
+    updated_session = {
+        **session,
+        "current_task_index": next_task_index,
+        "user_answers": user_answers,
+        "evaluation_results": evaluation_results,
+        "updated_at": utc_now_iso(),
+    }
+
+    feedback_lines = [
+        f"{result_label(result)}.",
+    ]
+    if evaluation.get("feedback"):
+        feedback_lines.append(html.escape(evaluation["feedback"]))
+
+    if next_task_index >= len(tasks):
+        updated_session["completed_at"] = utc_now_iso()
+        clear_session(str(session["telegram_user_id"]))
+        return "\n".join(feedback_lines + ["", build_training_summary(updated_session)])
+
+    save_session(str(session["telegram_user_id"]), updated_session)
+    return "\n\n".join(
+        [
+            "\n".join(feedback_lines),
+            build_task_prompt(tasks[next_task_index], next_task_index + 1, len(tasks)),
+        ]
+    )
 
 
 # ---------------------------------------------------------------------------
-# Practice: stats
+# Edit sessions
+# ---------------------------------------------------------------------------
+
+
+def parse_card_input_text(text: str) -> CardInput:
+    parts = [part.strip() for part in text.split("|")]
+
+    if len(parts) not in (4, 5) or any(not part for part in parts[:4]):
+        raise UserInputError(EDIT_CARD_PROMPT)
+
+    cloze_sentence = parts[4] if len(parts) == 5 and parts[4] else None
+    return CardInput(
+        word=parts[0],
+        translation=parts[1],
+        usage=parts[2],
+        example=parts[3],
+        cloze_sentence=cloze_sentence,
+    )
+
+
+def build_edit_card_prompt(item: dict[str, Any]) -> str:
+    lines = [
+        EDIT_CARD_PROMPT,
+        "",
+        "Current:",
+        (
+            f"{html.escape(str(item.get('word') or ''))} | "
+            f"{html.escape(str(item.get('translation') or ''))} | "
+            f"{html.escape(str(item.get('usage_tag') or ''))} | "
+            f"{html.escape(str(item.get('example') or ''))}"
+        ),
+    ]
+    return "\n".join(lines)
+
+
+def start_edit_card_session(
+    normalized_word: str,
+    telegram_user_id: str,
+    config: dict[str, str],
+) -> tuple[str, dict[str, Any] | None]:
+    word_key = build_word_key(
+        deck_id=config["MOCHI_DECK_ID"],
+        normalized_word=normalized_word,
+    )
+    item = get_known_words_table().get_item(Key={"word_key": word_key}, ConsistentRead=True).get("Item")
+
+    if not item:
+        raise UserInputError(WORD_NOT_FOUND_TEXT)
+
+    session = {
+        "telegram_user_id": str(telegram_user_id),
+        "session_type": PRACTICE_SESSION_TYPE_EDIT,
+        "word_key": word_key,
+        "created_at": utc_now_iso(),
+        "expires_at": int(time.time()) + PRACTICE_SESSION_TTL_SECONDS,
+        "status": SESSION_STATUS_ACTIVE,
+    }
+    save_session(str(telegram_user_id), session)
+
+    return build_edit_card_prompt(item), build_inline_keyboard(
+        (
+            ((CANCEL_BUTTON_TEXT, CALLBACK_CANCEL),),
+        )
+    )
+
+
+def handle_edit_card_answer(
+    session: dict[str, Any],
+    user_text: str,
+    config: dict[str, str],
+) -> tuple[str, dict[str, Any] | None]:
+    card = parse_card_input_text(user_text)
+    result = update_known_word_from_edit(
+        old_word_key=str(session["word_key"]),
+        card=card,
+        config=config,
+    )
+    clear_session(str(session["telegram_user_id"]))
+    return build_add_result_reply(result, title="Updated")
+
+
+# ---------------------------------------------------------------------------
+# Active practice: stats
 # ---------------------------------------------------------------------------
 
 
 def build_stats_reply() -> str:
     words = get_known_words_for_practice(limit=STATS_SCAN_LIMIT)
-    now_iso = utc_now_iso()
-
-    reviewed = sum(1 for item in words if int(item.get("review_count") or 0) > 0)
-    due = sum(1 for item in words if is_due_word(item, now_iso))
-    weak = sum(1 for item in words if is_weak_word(item))
+    practiced = sum(1 for item in words if int(item.get("practice_attempt_count") or 0) > 0)
+    attempts = sum(int(item.get("practice_attempt_count") or 0) for item in words)
+    correct = sum(int(item.get("correct_count") or 0) for item in words)
+    minor = sum(int(item.get("minor_issue_count") or 0) for item in words)
+    wrong = sum(int(item.get("wrong_count") or 0) for item in words)
+    accuracy = round(correct / attempts * 100) if attempts else 0
 
     return (
         f"Total words: {len(words)}\n"
-        f"Reviewed words: {reviewed}\n"
-        f"Due today: {due}\n"
-        f"Weak words: {weak}"
+        f"Practiced words: {practiced}\n"
+        f"Practice attempts: {attempts}\n"
+        f"Correct: {correct}\n"
+        f"Minor issues: {minor}\n"
+        f"Wrong: {wrong}\n"
+        f"Practice accuracy: {accuracy}%"
     )
+
+
+# ---------------------------------------------------------------------------
+# Migration
+# ---------------------------------------------------------------------------
+
+
+def migrate_legacy_practice_item(item: dict[str, Any], now_iso: str) -> dict[str, Any]:
+    needs_migration = any(attribute in item for attribute in LEGACY_CARD_SRS_ATTRIBUTES)
+    needs_migration = needs_migration or any(
+        attribute not in item
+        for attribute in (
+            "practice_attempt_count",
+            "correct_count",
+            "wrong_count",
+            "minor_issue_count",
+            "practice_score",
+            "practice_interval_days",
+            "next_practice_at",
+        )
+    )
+
+    if not needs_migration:
+        return item
+
+    migrated = dict(item)
+    correct_count = int(migrated.get("correct_count") or 0)
+    wrong_count = int(migrated.get("wrong_count") or 0)
+    minor_issue_count = int(migrated.get("minor_issue_count") or 0)
+
+    migrated.setdefault("practice_attempt_count", int(migrated.get("review_count") or 0))
+    migrated.setdefault("correct_count", correct_count)
+    migrated.setdefault("wrong_count", wrong_count)
+    migrated.setdefault("minor_issue_count", minor_issue_count)
+    migrated.setdefault(
+        "practice_score",
+        min(wrong_count * 2 + minor_issue_count, PRACTICE_MAX_PRIORITY_SCORE),
+    )
+    migrated.setdefault("practice_interval_days", 0)
+    migrated.setdefault("next_practice_at", now_iso)
+    migrated["updated_at"] = now_iso
+
+    for attribute in LEGACY_CARD_SRS_ATTRIBUTES:
+        migrated.pop(attribute, None)
+
+    return migrated
+
+
+def migrate_legacy_practice_stats() -> dict[str, Any]:
+    table = get_known_words_table()
+    now_iso = utc_now_iso()
+    scanned = 0
+    migrated_count = 0
+
+    for item in scan_known_word_items():
+        scanned += 1
+        migrated = migrate_legacy_practice_item(item, now_iso)
+
+        if migrated == item:
+            continue
+
+        table.put_item(Item=migrated)
+        migrated_count += 1
+
+    log_event("legacy_practice_stats_migrated", scanned=scanned, migrated=migrated_count)
+    return {"ok": True, "scanned": scanned, "migrated": migrated_count}
 
 
 # ---------------------------------------------------------------------------
@@ -1376,10 +2113,23 @@ def handle_add_card(event: dict[str, Any]) -> dict[str, Any]:
         translation=require_string_field(data, "translation"),
         usage=require_string_field(data, "usage"),
         example=require_string_field(data, "example"),
+        cloze_sentence=optional_string_field(data, "cloze_sentence"),
     )
 
     result = add_card(card, config, source="api")
     return json_response(200, result.to_dict())
+
+
+def handle_migrate_practice_stats(event: dict[str, Any]) -> dict[str, Any]:
+    config = get_app_config()
+    require_secret_header(event, "x-bot-secret", config["APP_SECRET"])
+    return json_response(200, migrate_legacy_practice_stats())
+
+
+def handle_sync_telegram_commands(event: dict[str, Any]) -> dict[str, Any]:
+    config = get_app_config()
+    require_secret_header(event, "x-bot-secret", config["APP_SECRET"])
+    return json_response(200, sync_telegram_bot_commands(config))
 
 
 def dispatch_callback(data: str, user_id: str, config: dict[str, str]) -> tuple[str, dict[str, Any] | None] | None:
@@ -1388,6 +2138,9 @@ def dispatch_callback(data: str, user_id: str, config: dict[str, str]) -> tuple[
         result = regenerate_card(data[len(CALLBACK_REGEN_PREFIX):], config)
         return build_add_result_reply(result, title="Regenerated")
 
+    if data.startswith(CALLBACK_EDIT_PREFIX):
+        return start_edit_card_session(data[len(CALLBACK_EDIT_PREFIX):], user_id, config)
+
     if data.startswith(CALLBACK_DELETE_CONFIRM_PREFIX):
         return delete_known_word(data[len(CALLBACK_DELETE_CONFIRM_PREFIX):], config), None
 
@@ -1395,6 +2148,7 @@ def dispatch_callback(data: str, user_id: str, config: dict[str, str]) -> tuple[
         return build_delete_confirmation(data[len(CALLBACK_DELETE_PREFIX):], config)
 
     if data == CALLBACK_CANCEL:
+        clear_session(user_id)
         return CANCELLED_TEXT, None
 
     if not data.startswith("practice:"):
@@ -1403,20 +2157,11 @@ def dispatch_callback(data: str, user_id: str, config: dict[str, str]) -> tuple[
     choice = data.split(":", 1)[1]
     log_event("practice_callback", choice=choice)
 
-    if choice == "menu":
-        return PRACTICE_MENU_TEXT, build_practice_menu()
-
     if choice == "stats":
         return build_stats_reply(), None
 
     if choice == "today":
-        return start_practice_session(user_id, PRACTICE_MODE_EN_RU, source=PRACTICE_SOURCE_DUE), None
-
-    if choice == "weak":
-        return start_practice_session(user_id, PRACTICE_MODE_EN_RU, source=PRACTICE_SOURCE_WEAK), None
-
-    if choice in PRACTICE_MODES:
-        return start_practice_session(user_id, choice), None
+        return start_today_practice_session(user_id, config), None
 
     return None
 
@@ -1443,7 +2188,7 @@ def handle_callback_query(callback_query: dict[str, Any], config: dict[str, str]
     except UserInputError as error:
         reply = str(error)
     except AiGenerationError:
-        reply = "AI could not generate this card. Please try again later."
+        reply = "AI could not complete this request. Please try again later."
     except Exception as error:
         log_event("callback_error", error_type=type(error).__name__)
         reply = GENERIC_ERROR_TEXT
@@ -1484,7 +2229,7 @@ def handle_telegram_webhook(event: dict[str, Any]) -> dict[str, Any]:
         # Input-format errors quote HELP_TEXT, so attach the help buttons too.
         reply, reply_markup = str(error), build_help_menu()
     except AiGenerationError:
-        reply = "AI could not generate this card. Please try again later."
+        reply = "AI could not complete this request. Please try again later."
     except Exception as error:
         log_event("telegram_processing_error", error_type=type(error).__name__)
         reply = GENERIC_ERROR_TEXT
@@ -1512,6 +2257,12 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
 
         if method == "POST" and path == "/add-card":
             return handle_add_card(event)
+
+        if method == "POST" and path == "/migrate-practice-stats":
+            return handle_migrate_practice_stats(event)
+
+        if method == "POST" and path == "/sync-telegram-commands":
+            return handle_sync_telegram_commands(event)
 
         if method == "POST" and path == "/telegram":
             return handle_telegram_webhook(event)

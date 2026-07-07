@@ -51,42 +51,40 @@ STATUS_CREATED = "CREATED"
 STATUS_FAILED = "FAILED"
 
 # ---------------------------------------------------------------------------
-# Practice
+# Active practice
 # ---------------------------------------------------------------------------
 
-PRACTICE_MODE_EN_RU = "en_ru"
-PRACTICE_MODE_RU_EN = "ru_en"
-PRACTICE_MODE_CLOZE = "cloze"
-PRACTICE_MODE_WRITE_SENTENCE = "write_sentence"
+PRACTICE_MODE_TODAY = "today"
+PRACTICE_SESSION_TYPE_ACTIVE = "active_practice"
+PRACTICE_SESSION_TYPE_EDIT = "edit_card"
+TASK_TYPE_FILL_BLANK = "fill_blank"
+TASK_TYPE_TRANSLATE_RU_EN = "translate_ru_en"
+TASK_TYPE_OWN_SENTENCE = "own_sentence"
 
-PRACTICE_MODES = (
-    PRACTICE_MODE_EN_RU,
-    PRACTICE_MODE_RU_EN,
-    PRACTICE_MODE_CLOZE,
-    PRACTICE_MODE_WRITE_SENTENCE,
-)
-
-# Practice word sources.
-PRACTICE_SOURCE_RANDOM = "random"
-PRACTICE_SOURCE_DUE = "due"
-PRACTICE_SOURCE_WEAK = "weak"
-
-PRACTICE_QUESTION_COUNT = 10
-PRACTICE_SCAN_LIMIT = 50
+PRACTICE_QUESTION_COUNT = 30
+PRACTICE_BLOCK_QUESTION_COUNT = 10
+PRACTICE_SCAN_LIMIT = 5_000
 STATS_SCAN_LIMIT = 500
 PRACTICE_SESSION_TTL_SECONDS = 3600
+ANSWER_FUZZY_MATCH_THRESHOLD = 0.85
 
 SESSION_STATUS_ACTIVE = "active"
 
 RESULT_CORRECT = "correct"
+RESULT_MINOR_ISSUE = "minor_issue"
 RESULT_WRONG = "wrong"
 
-# Simple spaced repetition: interval in days by streak; longer streaks cap out.
-SRS_INTERVALS_BY_STREAK = {1: 1, 2: 3, 3: 7, 4: 14}
-SRS_MAX_INTERVAL_DAYS = 30
-
-# A word is "weak" when its correct rate falls below this threshold.
-WEAK_CORRECT_RATE_THRESHOLD = 0.6
+# Lightweight scheduling for Telegram exercises only. Mochi remains the SRS.
+PRACTICE_CORRECT_INTERVAL_STEPS = (1, 3, 7, 14, 30)
+PRACTICE_MAX_PRIORITY_SCORE = 10
+LEGACY_CARD_SRS_ATTRIBUTES = (
+    "review_count",
+    "streak",
+    "interval_days",
+    "due_at",
+    "last_result",
+    "last_reviewed_at",
+)
 
 CLOZE_BLANK = "_____"
 
@@ -104,50 +102,50 @@ HELP_TEXT = (
     "Delete:\n"
     "/delete reliable\n"
     "\n"
+    "Practice:\n"
+    "/today\n"
+    "\n"
+    "Cancel edit/practice:\n"
+    "/cancel\n"
+    "\n"
     "Everything else is on the buttons below."
 )
 
 GENERIC_ERROR_TEXT = "Something went wrong. Please try again later."
 
-PRACTICE_MENU_TEXT = "Choose practice mode:"
-NOT_ENOUGH_WORDS_TEXT = "Not enough saved words for this practice mode yet."
-NO_DUE_WORDS_TEXT = "No words due today."
-NO_WEAK_WORDS_TEXT = "No weak words yet."
-
-# Inline keyboards as rows of (label, callback_data) pairs.
-PRACTICE_MENU_BUTTONS = (
-    (
-        ("EN → RU", f"practice:{PRACTICE_MODE_EN_RU}"),
-        ("RU → EN", f"practice:{PRACTICE_MODE_RU_EN}"),
-    ),
-    (
-        ("Fill blanks x10", f"practice:{PRACTICE_MODE_CLOZE}"),
-        ("Write sentence", f"practice:{PRACTICE_MODE_WRITE_SENTENCE}"),
-    ),
-    (
-        ("Today", "practice:today"),
-        ("Weak words", "practice:weak"),
-    ),
+NOT_ENOUGH_WORDS_TEXT = "Need at least 30 saved words with examples for active practice."
+TODAY_PRACTICE_INTRO = "Today's active practice. Fill in the blanks:"
+EDIT_CARD_PROMPT = (
+    "Send the updated card in this format:\n\n"
+    "word | translation | usage | example\n\n"
+    "You can also add a fifth field for a cloze sentence."
 )
 
 # Shown under help / unknown-command replies.
 HELP_MENU_BUTTONS = (
     (
-        ("Practice", "practice:menu"),
-        ("Stats", "practice:stats"),
-    ),
-    (
         ("Today", "practice:today"),
-        ("Weak words", "practice:weak"),
+        ("Stats", "practice:stats"),
     ),
 )
 
+TELEGRAM_BOT_COMMANDS = (
+    {"command": "add", "description": "Add a card manually"},
+    {"command": "ai", "description": "Generate and add a card"},
+    {"command": "delete", "description": "Delete a card"},
+    {"command": "today", "description": "Start active practice"},
+    {"command": "stats", "description": "Show active practice stats"},
+    {"command": "cancel", "description": "Cancel current edit or practice"},
+)
+
 REGENERATE_BUTTON_TEXT = "Regenerate"
+EDIT_BUTTON_TEXT = "Edit"
 DELETE_BUTTON_TEXT = "Delete"
 CONFIRM_DELETE_BUTTON_TEXT = "Yes, delete"
 CANCEL_BUTTON_TEXT = "Cancel"
 
 CALLBACK_REGEN_PREFIX = "regen:"
+CALLBACK_EDIT_PREFIX = "edit:"
 CALLBACK_DELETE_PREFIX = "del:"
 CALLBACK_DELETE_CONFIRM_PREFIX = "delc:"
 CALLBACK_CANCEL = "cancel"

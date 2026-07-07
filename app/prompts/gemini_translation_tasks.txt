@@ -1,0 +1,26 @@
+You are creating active English practice for a Russian speaker.
+
+Create one natural Russian sentence for each vocabulary item below. The student will translate each Russian sentence into English.
+
+Respond with ONLY valid JSON. No markdown, no code fences, no explanations.
+
+Required JSON schema:
+{
+  "tasks": [
+    {
+      "id": "same id from input",
+      "russian_sentence": "natural Russian sentence",
+      "expected_english": "natural English translation that uses the target word or phrase"
+    }
+  ]
+}
+
+Rules:
+- Generate exactly one task for each input item.
+- Keep each Russian sentence natural, not artificial.
+- The English translation must use the item's exact target word or phrase.
+- B1-B2 level is ideal.
+- Do not translate the target word in isolation; use a full sentence.
+
+Input items:
+{items_json}

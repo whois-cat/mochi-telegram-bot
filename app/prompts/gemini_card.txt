@@ -7,12 +7,15 @@ Required JSON schema:
   "word": "original English word or phrase",
   "translation": "short Russian translation",
   "usage": "noun | verb | adjective | adverb | phrase | phrasal verb | idiom | collocation | ...",
-  "example": "one natural English sentence"
+  "example": "one natural English sentence",
+  "cloze_sentence": "one natural English sentence where the word or phrase appears in its exact base form"
 }
 
 Rules:
 - "translation" must be in Russian.
 - "example" must be a natural English sentence at B1-B2 level.
+- "cloze_sentence" must be a natural English sentence at B1-B2 level.
+- "cloze_sentence" must contain the exact value of "word" as written in the JSON, not an inflected, conjugated, plural, or derived form.
 - "usage" must be concise (one or two words).
 
 Word or phrase: {word}
