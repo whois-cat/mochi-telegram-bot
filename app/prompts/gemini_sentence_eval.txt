@@ -10,7 +10,9 @@ Required JSON schema:
 {
   "result": "good" | "minor_issue" | "wrong_usage",
   "feedback": "one short sentence of feedback",
-  "better_sentence": "improved version of the sentence, or empty string if already good"
+  "better_sentence": "legacy field: same as target_word_sentence, or empty string if already good",
+  "target_word_sentence": "improved sentence that keeps the exact target word or phrase, or empty string if already good",
+  "natural_alternative": "optional natural sentence that may use a different word, or empty string"
 }
 
 Rules:
@@ -18,4 +20,11 @@ Rules:
 - "minor_issue": the word is used correctly but there is a small grammar or style problem.
 - "wrong_usage": the word is used incorrectly or its meaning is misunderstood.
 - Keep "feedback" short, at most 25 words.
-- If "result" is "good", "better_sentence" must be an empty string.
+- Treat contractions and full forms as equivalent.
+- Do not mark punctuation-only or case-only differences as issues.
+- The main correction must preserve the exact target word or phrase.
+- If the target word is unnatural in the user's context, explain why and provide a better context using the same target word.
+- Only "natural_alternative" may use a different word.
+- If "result" is "good", all correction fields must be empty strings.
+- If "result" is not "good", "target_word_sentence" is required and must contain the exact target word or phrase.
+- Set "better_sentence" to the same value as "target_word_sentence" for compatibility.

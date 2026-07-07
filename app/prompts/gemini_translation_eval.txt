@@ -19,4 +19,7 @@ Rules:
 - "correct": meaning is preserved and the English is natural enough.
 - "minor_issue": meaning is mostly right but there is a small grammar, word-choice, or target-word problem.
 - "wrong": meaning is wrong, target word is missing in a way that matters, or the answer is not English.
+- Treat contractions and full forms as equivalent.
+- Do not mark an answer as "minor_issue" only because it uses a contraction instead of a full form, or a full form instead of a contraction.
+- Do not mark punctuation-only or case-only differences as issues.
 - Keep feedback short, at most 25 words.

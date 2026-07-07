@@ -73,10 +73,15 @@ SESSION_STATUS_ACTIVE = "active"
 RESULT_CORRECT = "correct"
 RESULT_MINOR_ISSUE = "minor_issue"
 RESULT_WRONG = "wrong"
+RESULT_IDK = "idk"
+RESULT_HINT_REQUESTED = "hint_requested"
+RESULT_SKIPPED = "skipped"
 
 # Lightweight scheduling for Telegram exercises only. Mochi remains the SRS.
 PRACTICE_CORRECT_INTERVAL_STEPS = (1, 3, 7, 14, 30)
 PRACTICE_MAX_PRIORITY_SCORE = 10
+PRACTICE_HISTORY_TTL_SECONDS = 30 * 24 * 60 * 60
+SHORT_FEEDBACK_MAX_CHARS = 500
 LEGACY_CARD_SRS_ATTRIBUTES = (
     "review_count",
     "streak",
@@ -138,6 +143,8 @@ TELEGRAM_BOT_COMMANDS = (
     {"command": "cancel", "description": "Cancel current edit or practice"},
 )
 
+IDK_BUTTON_TEXT = "IDK"
+HINT_BUTTON_TEXT = "Hint"
 REGENERATE_BUTTON_TEXT = "Regenerate"
 EDIT_BUTTON_TEXT = "Edit"
 DELETE_BUTTON_TEXT = "Delete"
@@ -149,7 +156,24 @@ CALLBACK_EDIT_PREFIX = "edit:"
 CALLBACK_DELETE_PREFIX = "del:"
 CALLBACK_DELETE_CONFIRM_PREFIX = "delc:"
 CALLBACK_CANCEL = "cancel"
+CALLBACK_PRACTICE_IDK = "practice:idk"
+CALLBACK_PRACTICE_HINT = "practice:hint"
 TELEGRAM_CALLBACK_DATA_MAX_BYTES = 64
+
+IDK_TEXT_EQUIVALENTS = (
+    "idk",
+    "i don't know",
+    "i dont know",
+    "не знаю",
+    "не помню",
+    "забыла",
+    "не помню как переводится",
+)
+HINT_TEXT_EQUIVALENTS = (
+    "hint",
+    "подсказка",
+    "дай подсказку",
+)
 
 WORD_NOT_FOUND_TEXT = "Word not found."
 CANCELLED_TEXT = "Cancelled."

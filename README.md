@@ -56,6 +56,15 @@ The session is stored with:
 
 The bot asks one task at a time. At the end it shows a summary with correct, minor issue, and wrong counts, plus words worth practicing again.
 
+Each active task shows helper buttons:
+
+- `Hint` - gives a local hint and keeps the same task active. It does not update word stats.
+- `IDK` - records the task as `idk`, shows the answer/model answer, moves to the next task, and makes the word appear sooner in future practice.
+
+Text equivalents also work: `hint`, `подсказка`, `дай подсказку`, `idk`, `i don't know`, `не знаю`, `не помню`, `забыла`.
+
+Before using Gemini for evaluation, the bot runs local normalization and accepted-answer checks. It treats contractions/full forms, case-only differences, and simple punctuation differences as equivalent, for example `I am in the middle of` and `I'm in the middle of`.
+
 ## Practice Scheduling
 
 Telegram keeps lightweight practice scheduling only for active exercises. It does not manage Mochi's card SRS.
@@ -64,15 +73,28 @@ Per-word practice fields include:
 
 - `correct_count`
 - `wrong_count`
+- `idk_count`
 - `minor_issue_count`
 - `last_practiced_at`
 - `last_correct_at`
 - `last_wrong_at`
+- `last_idk_at`
 - `practice_interval_days`
 - `next_practice_at`
 - `practice_score`
 
 Words with errors, minor issues, low correctness, old practice dates, or elapsed `next_practice_at` are more likely to appear in future `/today` sessions.
+
+## Session Storage
+
+Active practice sessions use compact DynamoDB storage:
+
+- one small metadata item per active user session
+- one separate item per task
+- TTL on session/task items
+- short stored feedback capped at 500 characters
+
+Raw Gemini prompts/responses and long debug traces are not stored in DynamoDB. They belong in CloudWatch logs if needed.
 
 ## Editing
 
@@ -117,3 +139,13 @@ x-bot-secret: <APP_SECRET>
 ```
 
 This overwrites Telegram's bot command list with the current commands and removes old entries such as `/practice` and `/weak`.
+
+## Manual Test Checklist
+
+1. Add a word through the bot and confirm `Regenerate`, `Edit`, and `Delete` still appear.
+2. Start `/today`.
+3. Tap `Hint`; the same task should remain active and stats should not update.
+4. Tap `IDK`; the bot should show the answer and move to the next task.
+5. Answer with a full form where the expected answer uses a contraction.
+6. Try an own sentence with an awkward collocation; feedback should include `Better with "<target word>"`.
+7. Finish a full session and check the summary still lists all words that need more practice.

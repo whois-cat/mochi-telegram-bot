@@ -10,7 +10,8 @@ Required JSON schema:
     {
       "id": "same id from input",
       "russian_sentence": "natural Russian sentence",
-      "expected_english": "natural English translation that uses the target word or phrase"
+      "expected_english": "natural English translation that uses the target word or phrase",
+      "accepted_answers": ["optional natural equivalent translations"]
     }
   ]
 }
@@ -19,6 +20,8 @@ Rules:
 - Generate exactly one task for each input item.
 - Keep each Russian sentence natural, not artificial.
 - The English translation must use the item's exact target word or phrase.
+- Include 1-3 accepted_answers when there are obvious natural variants.
+- Accepted answers should preserve the same meaning and be full English sentences or phrases.
 - B1-B2 level is ideal.
 - Do not translate the target word in isolation; use a full sentence.
 

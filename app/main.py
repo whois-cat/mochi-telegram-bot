@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import base64
-import difflib
 import hmac
 import html
 import json
@@ -17,12 +16,14 @@ import boto3
 import requests
 from botocore.exceptions import ClientError
 
+from app.keyboards import build_help_menu, build_inline_keyboard, build_practice_task_keyboard
 from app.config import (
-    ANSWER_FUZZY_MATCH_THRESHOLD,
     CALLBACK_CANCEL,
     CALLBACK_DELETE_CONFIRM_PREFIX,
     CALLBACK_DELETE_PREFIX,
     CALLBACK_EDIT_PREFIX,
+    CALLBACK_PRACTICE_HINT,
+    CALLBACK_PRACTICE_IDK,
     CALLBACK_REGEN_PREFIX,
     CANCEL_BUTTON_TEXT,
     CANCELLED_TEXT,
@@ -33,7 +34,6 @@ from app.config import (
     EDIT_CARD_PROMPT,
     GEMINI_TIMEOUT_MS,
     GENERIC_ERROR_TEXT,
-    HELP_MENU_BUTTONS,
     HELP_TEXT,
     LEGACY_CARD_SRS_ATTRIBUTES,
     MOCHI_API_URL,
@@ -51,7 +51,10 @@ from app.config import (
     PRACTICE_SESSION_TYPE_EDIT,
     REGENERATE_BUTTON_TEXT,
     RESULT_CORRECT,
+    RESULT_HINT_REQUESTED,
+    RESULT_IDK,
     RESULT_MINOR_ISSUE,
+    RESULT_SKIPPED,
     RESULT_WRONG,
     SESSION_STATUS_ACTIVE,
     STATS_SCAN_LIMIT,
@@ -72,6 +75,24 @@ from app.config import (
     get_known_words_table_name,
     get_practice_sessions_table_name,
     load_prompt,
+)
+from app.services.evaluator import (
+    evaluate_short_answer_locally,
+    format_own_sentence_feedback,
+    precheck_own_sentence,
+    precheck_translation,
+)
+from app.services.hint_service import build_hint, is_hint_text, is_idk_text
+from app.services.normalization import contains_target_phrase, get_normalized_variants, normalize_text
+from app.services.task_generator import build_task_prompt
+from app.storage.sessions_repo import (
+    COMPACT_STORAGE_VERSION,
+    advance_session,
+    get_task as get_compact_task,
+    get_tasks as get_compact_tasks,
+    mark_session_status,
+    save_practice_session,
+    save_task_result,
 )
 
 try:
@@ -614,6 +635,8 @@ def evaluate_sentence_with_gemini(
         "result": str(data["result"]),
         "feedback": str(data.get("feedback") or "").strip(),
         "better_sentence": str(data.get("better_sentence") or "").strip(),
+        "target_word_sentence": str(data.get("target_word_sentence") or "").strip(),
+        "natural_alternative": str(data.get("natural_alternative") or "").strip(),
     }
 
 
@@ -764,11 +787,17 @@ def generate_translation_tasks_with_gemini(
         task_id = str(task.get("id") or "")
         russian_sentence = str(task.get("russian_sentence") or "").strip()
         expected_english = str(task.get("expected_english") or "").strip()
+        accepted_answers = task.get("accepted_answers") or []
+        if not isinstance(accepted_answers, list):
+            accepted_answers = []
 
         if task_id and russian_sentence and expected_english:
             generated[task_id] = {
                 "russian_sentence": russian_sentence,
                 "expected_english": expected_english,
+                "accepted_answers": [
+                    str(answer).strip() for answer in accepted_answers if str(answer).strip()
+                ],
             }
 
     return generated
@@ -1192,18 +1221,6 @@ def sync_telegram_bot_commands(config: dict[str, str]) -> dict[str, Any]:
     }
 
 
-def build_inline_keyboard(rows: tuple) -> dict[str, Any]:
-    return {
-        "inline_keyboard": [
-            [{"text": label, "callback_data": data} for label, data in row] for row in rows
-        ]
-    }
-
-
-def build_help_menu() -> dict[str, Any]:
-    return build_inline_keyboard(HELP_MENU_BUTTONS)
-
-
 def callback_data_for(prefix: str, word: str) -> str | None:
     """None when the word does not fit Telegram's callback_data size limit."""
     data = prefix + normalize_word_for_lookup(word)
@@ -1357,7 +1374,7 @@ def process_telegram_text(
     if session and not stripped.startswith("/"):
         if session.get("session_type") == PRACTICE_SESSION_TYPE_EDIT:
             return handle_edit_card_answer(session, stripped, config)
-        return handle_practice_answer(session, stripped, config), None
+        return handle_practice_answer(session, stripped, config)
 
     command = parse_telegram_command(stripped)
     log_event("telegram_command", mode=command.mode)
@@ -1370,7 +1387,7 @@ def process_telegram_text(
         return HELP_TEXT, build_help_menu()
 
     if command.mode == "practice_today":
-        return start_today_practice_session(telegram_user_id, config), None
+        return start_today_practice_session(telegram_user_id, config)
 
     if command.mode == "stats":
         return build_stats_reply(), None
@@ -1472,12 +1489,14 @@ def practice_candidate_score(item: dict[str, Any], now: datetime) -> float:
     correct_count = int(item.get("correct_count") or 0)
     wrong_count = int(item.get("wrong_count") or 0)
     minor_issue_count = int(item.get("minor_issue_count") or 0)
+    idk_count = int(item.get("idk_count") or 0)
     practice_score = int(item.get("practice_score") or 0)
     last_practiced_at = parse_iso_datetime(item.get("last_practiced_at"))
     next_practice_at = parse_iso_datetime(item.get("next_practice_at"))
 
     score = random.random()
     score += wrong_count * 3
+    score += idk_count * 3
     score += minor_issue_count * 2
     score += practice_score * 2
     score -= correct_count * 0.4
@@ -1547,12 +1566,14 @@ def build_today_practice_questions(
             {
                 "task_type": TASK_TYPE_FILL_BLANK,
                 "linked_word_keys": [word_key],
+                "target_word_keys": [word_key],
                 "word": word,
                 "translation": translation,
                 "prompt": f"{blanked} ({translation})",
                 "source_sentence": generated_sentence,
                 "support_words": generated.get("support_words") or [],
                 "expected_answer": word,
+                "accepted_answers": [word],
                 "acceptable_answers": [word],
             }
         )
@@ -1575,16 +1596,23 @@ def build_translation_practice_questions(
 
         russian_sentence = generated["russian_sentence"]
         expected_english = generated["expected_english"]
+        accepted_answers = [
+            expected_english,
+            *generated.get("accepted_answers", []),
+            *sorted(get_normalized_variants(expected_english)),
+        ]
 
         questions.append(
             {
                 "task_type": TASK_TYPE_TRANSLATE_RU_EN,
                 "linked_word_keys": [word_key],
+                "target_word_keys": [word_key],
                 "word": word,
                 "translation": str(item.get("translation") or ""),
                 "russian_sentence": russian_sentence,
                 "prompt": f"Переведи на английский:\n{russian_sentence}",
                 "expected_answer": expected_english,
+                "accepted_answers": list(dict.fromkeys(accepted_answers)),
                 "acceptable_answers": [expected_english],
             }
         )
@@ -1597,33 +1625,17 @@ def build_own_sentence_practice_questions(words: list[dict[str, Any]]) -> list[d
         {
             "task_type": TASK_TYPE_OWN_SENTENCE,
             "linked_word_keys": [item["word_key"]],
+            "target_word_keys": [item["word_key"]],
             "word": str(item.get("word") or ""),
             "translation": str(item.get("translation") or ""),
+            "example": str(item.get("example") or ""),
             "prompt": f"Напиши свое предложение со словом/фразой: {item.get('word')}",
             "expected_answer": str(item.get("word") or ""),
+            "accepted_answers": [str(item.get("word") or "")],
             "acceptable_answers": [str(item.get("word") or "")],
         }
         for item in words
     ]
-
-
-def build_task_prompt(task: dict[str, Any], task_number: int, total_tasks: int) -> str:
-    task_type = task.get("task_type")
-    title_by_type = {
-        TASK_TYPE_FILL_BLANK: "Fill in the blank:",
-        TASK_TYPE_TRANSLATE_RU_EN: "Translation:",
-        TASK_TYPE_OWN_SENTENCE: "Own sentence:",
-    }
-    title = title_by_type.get(str(task_type), "Practice:")
-
-    return "\n".join(
-        [
-            f"Task {task_number}/{total_tasks}",
-            title,
-            "",
-            html.escape(str(task.get("prompt") or "")),
-        ]
-    )
 
 
 def build_today_practice_tasks(config: dict[str, str]) -> list[dict[str, Any]]:
@@ -1666,17 +1678,21 @@ def build_today_practice_tasks(config: dict[str, str]) -> list[dict[str, Any]]:
     return tasks
 
 
-def start_today_practice_session(telegram_user_id: str, config: dict[str, str]) -> str:
+def start_today_practice_session(
+    telegram_user_id: str,
+    config: dict[str, str],
+) -> tuple[str, dict[str, Any] | None]:
     tasks = build_today_practice_tasks(config)
 
     if len(tasks) < PRACTICE_QUESTION_COUNT:
-        return NOT_ENOUGH_WORDS_TEXT
+        return NOT_ENOUGH_WORDS_TEXT, None
 
     session = {
         "telegram_user_id": str(telegram_user_id),
         "user_id": str(telegram_user_id),
         "training_id": f"{telegram_user_id}:{int(time.time())}",
         "session_type": PRACTICE_SESSION_TYPE_ACTIVE,
+        "storage_version": COMPACT_STORAGE_VERSION,
         "mode": PRACTICE_MODE_TODAY,
         "tasks": tasks,
         "current_task_index": 0,
@@ -1689,11 +1705,14 @@ def start_today_practice_session(telegram_user_id: str, config: dict[str, str]) 
     save_session(str(telegram_user_id), session)
 
     log_event("active_practice_started", mode=PRACTICE_MODE_TODAY, tasks=len(tasks))
-    return "\n\n".join(
-        [
-            TODAY_PRACTICE_INTRO,
-            build_task_prompt(tasks[0], 1, len(tasks)),
-        ]
+    return (
+        "\n\n".join(
+            [
+                TODAY_PRACTICE_INTRO,
+                build_task_prompt(tasks[0], 1, len(tasks)),
+            ]
+        ),
+        build_practice_task_keyboard(),
     )
 
 
@@ -1707,6 +1726,19 @@ def get_practice_sessions_table():
 
 
 def save_session(telegram_user_id: str, session: dict[str, Any]) -> None:
+    if (
+        session.get("session_type") == PRACTICE_SESSION_TYPE_ACTIVE
+        and session.get("storage_version") == COMPACT_STORAGE_VERSION
+        and session.get("tasks")
+    ):
+        save_practice_session(
+            get_practice_sessions_table(),
+            user_id=str(telegram_user_id),
+            session=session,
+            tasks=list(session.get("tasks") or []),
+        )
+        return
+
     get_practice_sessions_table().put_item(Item=session)
 
 
@@ -1728,7 +1760,14 @@ def get_active_session(telegram_user_id: str) -> dict[str, Any] | None:
 
 
 def clear_session(telegram_user_id: str) -> None:
-    get_practice_sessions_table().delete_item(Key={"telegram_user_id": str(telegram_user_id)})
+    table = get_practice_sessions_table()
+    item = table.get_item(Key={"telegram_user_id": str(telegram_user_id)}, ConsistentRead=True).get("Item")
+
+    if item and item.get("storage_version") == COMPACT_STORAGE_VERSION:
+        mark_session_status(table, user_id=str(telegram_user_id), status="cancelled")
+        return
+
+    table.delete_item(Key={"telegram_user_id": str(telegram_user_id)})
 
 
 # ---------------------------------------------------------------------------
@@ -1790,11 +1829,18 @@ def update_word_practice_stats(word_key: str, result: str) -> None:
         ":next_practice_at": (now + timedelta(days=interval_days)).isoformat(),
     }
 
+    if result == RESULT_HINT_REQUESTED:
+        return
+
     if result == RESULT_CORRECT:
         set_parts.append("correct_count = if_not_exists(correct_count, :zero) + :one")
         set_parts.append("last_correct_at = :now")
     elif result == RESULT_MINOR_ISSUE:
         set_parts.append("minor_issue_count = if_not_exists(minor_issue_count, :zero) + :one")
+        set_parts.append("last_minor_issue_at = :now")
+    elif result == RESULT_IDK:
+        set_parts.append("idk_count = if_not_exists(idk_count, :zero) + :one")
+        set_parts.append("last_idk_at = :now")
     else:
         set_parts.append("wrong_count = if_not_exists(wrong_count, :zero) + :one")
         set_parts.append("last_wrong_at = :now")
@@ -1812,50 +1858,29 @@ def update_word_practice_stats(word_key: str, result: str) -> None:
 
 
 def normalize_answer(value: str) -> str:
-    value = unicodedata.normalize("NFKC", value)
-    value = value.strip().strip(".,!?;:'\"()«»—–-").strip().lower()
-    return " ".join(value.split())
+    return normalize_text(value)
 
 
 def answer_matches(expected: str, answer: str) -> bool:
     return answer_match_result(expected, answer) in (RESULT_CORRECT, RESULT_MINOR_ISSUE)
 
 
-def answer_match_result(expected: str, answer: str) -> str:
-    answer_norm = normalize_answer(answer)
-    expected_options = []
-
-    for option in expected.split(","):
-        option_norm = normalize_answer(option)
-        if option_norm:
-            expected_options.append(option_norm)
-
-    if not answer_norm or not expected_options:
-        return RESULT_WRONG
-
-    if any(answer_norm == option for option in expected_options):
-        return RESULT_CORRECT
-
-    if any(
-        difflib.SequenceMatcher(None, answer_norm, option).ratio()
-        >= ANSWER_FUZZY_MATCH_THRESHOLD
-        for option in expected_options
-    ):
-        return RESULT_MINOR_ISSUE
-
-    return RESULT_WRONG
+def answer_match_result(
+    expected: str,
+    answer: str,
+    accepted_answers: list[str] | None = None,
+) -> str:
+    task = {
+        "expected_answer": expected,
+        "accepted_answers": accepted_answers or [
+            option.strip() for option in expected.split(",") if option.strip()
+        ],
+    }
+    return evaluate_short_answer_locally(task, answer)["result"]
 
 
 def evaluate_fill_blank_answer(task: dict[str, Any], user_answer: str) -> dict[str, str]:
-    result = answer_match_result(str(task.get("expected_answer") or ""), user_answer)
-    if result == RESULT_CORRECT:
-        feedback = "Correct."
-    elif result == RESULT_MINOR_ISSUE:
-        feedback = f"Minor issue. Expected: {task.get('expected_answer')}"
-    else:
-        feedback = f"Wrong. Correct: {task.get('expected_answer')}"
-
-    return {"result": result, "feedback": feedback}
+    return evaluate_short_answer_locally(task, user_answer)
 
 
 def evaluate_own_sentence_answer(
@@ -1863,18 +1888,34 @@ def evaluate_own_sentence_answer(
     user_answer: str,
     config: dict[str, str],
 ) -> dict[str, str]:
+    precheck = precheck_own_sentence(task, user_answer)
+    if precheck:
+        return precheck
+
     evaluation = evaluate_sentence_with_gemini(str(task.get("word") or ""), user_answer, config)
     result_map = {
         "good": RESULT_CORRECT,
         "minor_issue": RESULT_MINOR_ISSUE,
         "wrong_usage": RESULT_WRONG,
     }
-    feedback = evaluation.get("feedback") or ""
-    if evaluation["result"] != "good" and evaluation.get("better_sentence"):
-        feedback = f"{feedback} Better: {evaluation['better_sentence']}".strip()
+    result = result_map[evaluation["result"]]
+    target_word_sentence = (
+        evaluation.get("target_word_sentence")
+        or evaluation.get("better_sentence")
+        or ""
+    )
+    if target_word_sentence and not contains_target_phrase(target_word_sentence, str(task.get("word") or "")):
+        target_word_sentence = ""
+    feedback = format_own_sentence_feedback(
+        word=str(task.get("word") or ""),
+        result=result,
+        feedback=evaluation.get("feedback") or "",
+        target_word_sentence=target_word_sentence,
+        natural_alternative=evaluation.get("natural_alternative") or "",
+    )
 
     return {
-        "result": result_map[evaluation["result"]],
+        "result": result,
         "feedback": feedback or evaluation["result"],
     }
 
@@ -1890,6 +1931,9 @@ def evaluate_training_task(
         return evaluate_fill_blank_answer(task, user_answer)
 
     if task_type == TASK_TYPE_TRANSLATE_RU_EN:
+        precheck = precheck_translation(task, user_answer)
+        if precheck:
+            return precheck
         return evaluate_translation_with_gemini(task, user_answer, config)
 
     if task_type == TASK_TYPE_OWN_SENTENCE:
@@ -1903,31 +1947,83 @@ def result_label(result: str) -> str:
         return "Correct"
     if result == RESULT_MINOR_ISSUE:
         return "Minor issue"
+    if result == RESULT_IDK:
+        return "IDK"
+    if result == RESULT_SKIPPED:
+        return "Skipped"
+    if result == RESULT_HINT_REQUESTED:
+        return "Hint"
     return "Wrong"
 
 
 def update_practice_stats_for_task(task: dict[str, Any], result: str) -> None:
-    for word_key in task.get("linked_word_keys") or []:
+    if result == RESULT_HINT_REQUESTED:
+        return
+
+    for word_key in task.get("target_word_keys") or task.get("linked_word_keys") or []:
         update_word_practice_stats(str(word_key), result)
 
 
-def build_training_summary(session: dict[str, Any]) -> str:
-    results = session.get("evaluation_results") or []
+def is_compact_practice_session(session: dict[str, Any]) -> bool:
+    return session.get("storage_version") == COMPACT_STORAGE_VERSION
+
+
+def load_session_task(session: dict[str, Any], task_index: int) -> dict[str, Any] | None:
+    if is_compact_practice_session(session):
+        return get_compact_task(
+            get_practice_sessions_table(),
+            user_id=str(session["telegram_user_id"]),
+            session_id=str(session["session_id"]),
+            task_index=task_index,
+        )
+
     tasks = session.get("tasks") or []
-    correct = sum(1 for item in results if item.get("result") == RESULT_CORRECT)
-    minor = sum(1 for item in results if item.get("result") == RESULT_MINOR_ISSUE)
-    wrong = sum(1 for item in results if item.get("result") == RESULT_WRONG)
+    if 0 <= task_index < len(tasks):
+        return tasks[task_index]
+
+    return None
+
+
+def load_session_tasks(session: dict[str, Any]) -> list[dict[str, Any]]:
+    if is_compact_practice_session(session):
+        return get_compact_tasks(
+            get_practice_sessions_table(),
+            user_id=str(session["telegram_user_id"]),
+            session_id=str(session["session_id"]),
+            total_tasks=int(session.get("total_tasks") or 0),
+        )
+
+    return list(session.get("tasks") or [])
+
+
+def task_result_for_summary(task: dict[str, Any]) -> str:
+    return str(task.get("evaluation_result") or task.get("result") or "")
+
+
+def build_training_summary(session: dict[str, Any], tasks: list[dict[str, Any]] | None = None) -> str:
+    tasks = tasks if tasks is not None else load_session_tasks(session)
+    legacy_results = {
+        int(item.get("task_index") or 0): str(item.get("result") or "")
+        for item in session.get("evaluation_results") or []
+    }
+    results = [
+        task_result_for_summary(task) or legacy_results.get(index, "")
+        for index, task in enumerate(tasks)
+    ]
+    correct = sum(1 for result in results if result == RESULT_CORRECT)
+    minor = sum(1 for result in results if result == RESULT_MINOR_ISSUE)
+    wrong = sum(1 for result in results if result == RESULT_WRONG)
+    idk = sum(1 for result in results if result == RESULT_IDK)
+    skipped = sum(1 for result in results if result == RESULT_SKIPPED)
 
     practice_again = []
-    for result in results:
-        if result.get("result") == RESULT_CORRECT:
+    for task, result in zip(tasks, results):
+        if result in (RESULT_CORRECT, RESULT_HINT_REQUESTED, ""):
             continue
 
-        task_index = int(result.get("task_index") or 0)
-        if 0 <= task_index < len(tasks):
-            word = str(tasks[task_index].get("word") or "")
-            if word and word not in practice_again:
-                practice_again.append(word)
+        word = str(task.get("word") or "")
+        if word and word not in practice_again:
+            practice_again.append(word)
 
     lines = [
         "Готово.",
@@ -1936,6 +2032,10 @@ def build_training_summary(session: dict[str, Any]) -> str:
         f"Minor issues: {minor}",
         f"Wrong: {wrong}",
     ]
+    if idk:
+        lines.append(f"IDK: {idk}")
+    if skipped:
+        lines.append(f"Skipped: {skipped}")
 
     if practice_again:
         lines += ["", "Слова, которые стоит потренировать еще:"]
@@ -1948,46 +2048,100 @@ def handle_practice_answer(
     session: dict[str, Any],
     user_text: str,
     config: dict[str, str],
-) -> str:
-    tasks = session.get("tasks") or []
+) -> tuple[str, dict[str, Any] | None]:
+    total_tasks = int(session.get("total_tasks") or len(session.get("tasks") or []))
     current_task_index = int(session.get("current_task_index") or 0)
 
-    if current_task_index >= len(tasks):
-        clear_session(str(session["telegram_user_id"]))
-        return build_training_summary(session)
+    if current_task_index >= total_tasks:
+        tasks = load_session_tasks(session)
+        if is_compact_practice_session(session):
+            mark_session_status(
+                get_practice_sessions_table(),
+                user_id=str(session["telegram_user_id"]),
+                status="completed",
+            )
+        else:
+            clear_session(str(session["telegram_user_id"]))
+        return build_training_summary(session, tasks), None
 
-    task = tasks[current_task_index]
-    evaluation = evaluate_training_task(task, user_text, config)
+    task = load_session_task(session, current_task_index)
+    if not task:
+        clear_session(str(session["telegram_user_id"]))
+        return GENERIC_ERROR_TEXT, None
+
+    if is_hint_text(user_text):
+        hint = build_hint(task)
+        return (
+            "\n\n".join(
+                [
+                    html.escape(hint),
+                    build_task_prompt(task, current_task_index + 1, total_tasks),
+                ]
+            ),
+            build_practice_task_keyboard(),
+        )
+
+    if is_idk_text(user_text):
+        evaluation = {
+            "result": RESULT_IDK,
+            "feedback": f"Correct answer: {task.get('expected_answer')}",
+        }
+    else:
+        evaluation = evaluate_training_task(task, user_text, config)
+
     result = evaluation["result"]
     update_practice_stats_for_task(task, result)
 
-    user_answers = list(session.get("user_answers") or [])
-    evaluation_results = list(session.get("evaluation_results") or [])
-    user_answers.append(
-        {
-            "task_index": current_task_index,
-            "answer": user_text,
-            "answered_at": utc_now_iso(),
-        }
-    )
-    evaluation_results.append(
-        {
-            "task_index": current_task_index,
-            "task_type": task.get("task_type"),
-            "result": result,
-            "feedback": evaluation.get("feedback") or "",
-            "evaluated_at": utc_now_iso(),
-        }
-    )
-
     next_task_index = current_task_index + 1
-    updated_session = {
-        **session,
-        "current_task_index": next_task_index,
-        "user_answers": user_answers,
-        "evaluation_results": evaluation_results,
-        "updated_at": utc_now_iso(),
-    }
+    completed = next_task_index >= total_tasks
+
+    if is_compact_practice_session(session):
+        table = get_practice_sessions_table()
+        save_task_result(
+            table,
+            user_id=str(session["telegram_user_id"]),
+            session_id=str(session["session_id"]),
+            task_index=current_task_index,
+            user_answer=user_text,
+            evaluation=evaluation,
+        )
+        advance_session(
+            table,
+            user_id=str(session["telegram_user_id"]),
+            next_task_index=next_task_index,
+            result=result,
+            completed=completed,
+        )
+        updated_session = {
+            **session,
+            "current_task_index": next_task_index,
+        }
+    else:
+        user_answers = list(session.get("user_answers") or [])
+        evaluation_results = list(session.get("evaluation_results") or [])
+        user_answers.append(
+            {
+                "task_index": current_task_index,
+                "answer": user_text,
+                "answered_at": utc_now_iso(),
+            }
+        )
+        evaluation_results.append(
+            {
+                "task_index": current_task_index,
+                "task_type": task.get("task_type"),
+                "result": result,
+                "feedback": evaluation.get("feedback") or "",
+                "evaluated_at": utc_now_iso(),
+            }
+        )
+        updated_session = {
+            **session,
+            "current_task_index": next_task_index,
+            "user_answers": user_answers,
+            "evaluation_results": evaluation_results,
+            "updated_at": utc_now_iso(),
+        }
 
     feedback_lines = [
         f"{result_label(result)}.",
@@ -1995,18 +2149,27 @@ def handle_practice_answer(
     if evaluation.get("feedback"):
         feedback_lines.append(html.escape(evaluation["feedback"]))
 
-    if next_task_index >= len(tasks):
-        updated_session["completed_at"] = utc_now_iso()
-        clear_session(str(session["telegram_user_id"]))
-        return "\n".join(feedback_lines + ["", build_training_summary(updated_session)])
+    if completed:
+        if not is_compact_practice_session(updated_session):
+            updated_session["completed_at"] = utc_now_iso()
+            clear_session(str(session["telegram_user_id"]))
+        tasks = load_session_tasks(updated_session)
+        return "\n".join(feedback_lines + ["", build_training_summary(updated_session, tasks)]), None
 
-    save_session(str(session["telegram_user_id"]), updated_session)
+    next_task = load_session_task(updated_session, next_task_index)
+    if not next_task:
+        clear_session(str(session["telegram_user_id"]))
+        return "\n".join(feedback_lines + ["", GENERIC_ERROR_TEXT]), None
+
+    if not is_compact_practice_session(updated_session):
+        save_session(str(session["telegram_user_id"]), updated_session)
+
     return "\n\n".join(
         [
             "\n".join(feedback_lines),
-            build_task_prompt(tasks[next_task_index], next_task_index + 1, len(tasks)),
+            build_task_prompt(next_task, next_task_index + 1, total_tasks),
         ]
-    )
+    ), build_practice_task_keyboard()
 
 
 # ---------------------------------------------------------------------------
@@ -2103,6 +2266,7 @@ def build_stats_reply() -> str:
     correct = sum(int(item.get("correct_count") or 0) for item in words)
     minor = sum(int(item.get("minor_issue_count") or 0) for item in words)
     wrong = sum(int(item.get("wrong_count") or 0) for item in words)
+    idk = sum(int(item.get("idk_count") or 0) for item in words)
     accuracy = round(correct / attempts * 100) if attempts else 0
 
     return (
@@ -2112,6 +2276,7 @@ def build_stats_reply() -> str:
         f"Correct: {correct}\n"
         f"Minor issues: {minor}\n"
         f"Wrong: {wrong}\n"
+        f"IDK: {idk}\n"
         f"Practice accuracy: {accuracy}%"
     )
 
@@ -2130,6 +2295,7 @@ def migrate_legacy_practice_item(item: dict[str, Any], now_iso: str) -> dict[str
             "correct_count",
             "wrong_count",
             "minor_issue_count",
+            "idk_count",
             "practice_score",
             "practice_interval_days",
             "next_practice_at",
@@ -2143,11 +2309,13 @@ def migrate_legacy_practice_item(item: dict[str, Any], now_iso: str) -> dict[str
     correct_count = int(migrated.get("correct_count") or 0)
     wrong_count = int(migrated.get("wrong_count") or 0)
     minor_issue_count = int(migrated.get("minor_issue_count") or 0)
+    idk_count = int(migrated.get("idk_count") or 0)
 
     migrated.setdefault("practice_attempt_count", int(migrated.get("review_count") or 0))
     migrated.setdefault("correct_count", correct_count)
     migrated.setdefault("wrong_count", wrong_count)
     migrated.setdefault("minor_issue_count", minor_issue_count)
+    migrated.setdefault("idk_count", idk_count)
     migrated.setdefault(
         "practice_score",
         min(wrong_count * 2 + minor_issue_count, PRACTICE_MAX_PRIORITY_SCORE),
@@ -2245,11 +2413,23 @@ def dispatch_callback(data: str, user_id: str, config: dict[str, str]) -> tuple[
     choice = data.split(":", 1)[1]
     log_event("practice_callback", choice=choice)
 
+    if data == CALLBACK_PRACTICE_HINT:
+        session = get_active_session(user_id)
+        if not session or session.get("session_type") != PRACTICE_SESSION_TYPE_ACTIVE:
+            return "No active practice session.", None
+        return handle_practice_answer(session, "hint", config)
+
+    if data == CALLBACK_PRACTICE_IDK:
+        session = get_active_session(user_id)
+        if not session or session.get("session_type") != PRACTICE_SESSION_TYPE_ACTIVE:
+            return "No active practice session.", None
+        return handle_practice_answer(session, "idk", config)
+
     if choice == "stats":
         return build_stats_reply(), None
 
     if choice == "today":
-        return start_today_practice_session(user_id, config), None
+        return start_today_practice_session(user_id, config)
 
     return None
 
