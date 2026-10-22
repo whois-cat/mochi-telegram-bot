@@ -20,10 +20,9 @@ from botocore.exceptions import ClientError
 
 from app.keyboards import build_help_menu, build_inline_keyboard
 from app.config import (
+    ADDED_LINE,
     AI_COMMAND_DESTINATIONS,
     AI_ERROR_TEXT,
-    ALREADY_IN_MOCHI_TITLE,
-    BULK_AI_FAILED_LABEL,
     BULK_AI_LIST_MARKER_PATTERN,
     BULK_AI_MAX_WORDS,
     BULK_AI_MAX_WORKERS,
@@ -43,16 +42,16 @@ from app.config import (
     CONFIRM_DELETE_BUTTON_TEXT,
     DELETE_BUTTON_TEXT,
     DESTINATION_INBOX,
+    DESTINATION_LABELS,
     DESTINATION_MOCHI,
-    DRAFT_HINT_TEXT,
     EDIT_BUTTON_TEXT,
     EDIT_CARD_PROMPT,
     EDIT_SESSION_TTL_SECONDS,
+    FAILED_LINE,
     FREQUENCY_VALUES,
     GEMINI_TIMEOUT_MS,
     GENERIC_ERROR_TEXT,
     HELP_TEXT,
-    INBOX_DELETE_BUTTON_TEXT,
     INBOX_EMPTY_TEXT,
     INBOX_LIST_LIMIT,
     INBOX_NOTHING_TO_PROMOTE_TEXT,
@@ -61,6 +60,7 @@ from app.config import (
     INBOX_PROMOTE_MIN_SEEN,
     INBOX_SUGGEST_SEEN_COUNT,
     INBOX_SUGGEST_TEXT,
+    INBOX_WORD_TO_MOCHI_BUTTON_TEXT,
     LEGACY_CARD_SRS_ATTRIBUTES,
     MOCHI_API_URL,
     MOCHI_CARD_TEMPLATE,
@@ -81,7 +81,7 @@ from app.config import (
     TO_MOCHI_BUTTON_TEXT,
     USAGE_ALIASES,
     WORD_NOT_FOUND_TEXT,
-    WORD_STATUS_TITLES,
+    WORD_STATUS_LABELS,
     get_app_config,
     get_known_words_table_name,
     get_practice_sessions_table_name,
@@ -1239,33 +1239,46 @@ def extract_telegram_message(update: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
-def format_word_meta(*, frequency: str, level: str, seen_count: int) -> str:
-    """E.g. "common · B2 · seen 3×"; empty when there is nothing to show."""
-    parts = [part for part in (frequency, level) if part]
+def format_word_meta(*, frequency: str, level: str, status: str, seen_count: int) -> str:
+    """E.g. "common · B2 · in inbox · seen 3×"; empty when there is nothing to show."""
+    parts = [part for part in (frequency, level, WORD_STATUS_LABELS.get(status, "")) if part]
     if seen_count > 1:
         parts.append(f"seen {seen_count}×")
     return " · ".join(parts)
 
 
-def build_add_result_reply(result: AddCardResult, *, title: str | None = None) -> Reply:
-    """Card summary plus buttons that depend on where the word is now."""
-    status_title = WORD_STATUS_TITLES.get(result.status, result.status)
-    if result.status == STATUS_CREATED and not result.created:
-        status_title = ALREADY_IN_MOCHI_TITLE
+def is_just_added(result: AddCardResult) -> bool:
+    """Just sent to Mochi or Inbox: a one-line confirmation is enough."""
+    return result.created and result.status in DESTINATION_LABELS
 
-    header = f"{title} ({status_title})" if title else status_title
-    lines = [f"{header}: <b>{html.escape(result.word)}</b>"]
+
+def build_added_line(result: AddCardResult) -> str:
+    return ADDED_LINE.format(word=html.escape(result.word), destination=DESTINATION_LABELS[result.status])
+
+
+def build_failed_line(word: str) -> str:
+    return FAILED_LINE.format(word=html.escape(word))
+
+
+def build_add_result_reply(result: AddCardResult) -> Reply:
+    """A confirmation line, or the card with buttons that depend on where the word is."""
+    if is_just_added(result):
+        return build_added_line(result), None
+
+    lines = [f"<b>{html.escape(result.word)}</b>"]
     if result.translation:
-        lines += ["", f"<b>{html.escape(result.translation)}</b>"]
+        lines.append(html.escape(result.translation))
     if result.example:
         lines.append(f"<i>{html.escape(result.example)}</i>")
 
-    meta = format_word_meta(frequency=result.frequency, level=result.level, seen_count=result.seen_count)
+    meta = format_word_meta(
+        frequency=result.frequency,
+        level=result.level,
+        status=result.status,
+        seen_count=result.seen_count,
+    )
     if meta:
-        lines += ["", f"📊 {html.escape(meta)}"]
-
-    if result.status == STATUS_DRAFT:
-        lines.append(DRAFT_HINT_TEXT)
+        lines.append(html.escape(meta))
     if result.status in (STATUS_DRAFT, STATUS_INBOX) and result.seen_count >= INBOX_SUGGEST_SEEN_COUNT:
         lines.append(INBOX_SUGGEST_TEXT)
 
@@ -1273,11 +1286,19 @@ def build_add_result_reply(result: AddCardResult, *, title: str | None = None) -
 
 
 def build_word_replies(results: list[tuple[str, AddCardResult | None]]) -> list[Reply]:
-    """One message per word, so every card keeps its own buttons."""
-    return [
-        build_add_result_reply(result) if result else (f"{BULK_AI_FAILED_LABEL}: <b>{html.escape(word)}</b>", None)
-        for word, result in results
-    ]
+    """Confirmations and failures share one message; cards that need a choice get their own."""
+    lines: list[str] = []
+    cards: list[Reply] = []
+
+    for word, result in results:
+        if result is None:
+            lines.append(build_failed_line(word))
+        elif is_just_added(result):
+            lines.append(build_added_line(result))
+        else:
+            cards.append(build_add_result_reply(result))
+
+    return ([("\n".join(lines), None)] if lines else []) + cards
 
 
 def build_inbox_reply(config: dict[str, str]) -> Reply:
@@ -1286,7 +1307,7 @@ def build_inbox_reply(config: dict[str, str]) -> Reply:
         return INBOX_EMPTY_TEXT, None
 
     shown = items[:INBOX_LIST_LIMIT]
-    lines = [f"📥 Inbox: {len(items)}", ""]
+    lines = [f"<b>Inbox</b> · {len(items)}", ""]
     rows = []
 
     for index, item in enumerate(shown, start=1):
@@ -1294,6 +1315,7 @@ def build_inbox_reply(config: dict[str, str]) -> Reply:
         meta = format_word_meta(
             frequency=str(item.get("frequency") or ""),
             level=str(item.get("level") or ""),
+            status=STATUS_DRAFT,  # every item here is in inbox; no need to say so
             seen_count=int(item.get("seen_count") or 1),
         )
         line = f"{index}. <b>{html.escape(word)}</b> — {html.escape(str(item.get('translation') or ''))}"
@@ -1306,8 +1328,8 @@ def build_inbox_reply(config: dict[str, str]) -> Reply:
         if to_mochi and delete:
             rows.append(
                 [
-                    {"text": f"{TO_MOCHI_BUTTON_TEXT}: {word}", "callback_data": to_mochi},
-                    {"text": INBOX_DELETE_BUTTON_TEXT, "callback_data": delete},
+                    {"text": INBOX_WORD_TO_MOCHI_BUTTON_TEXT.format(word=word), "callback_data": to_mochi},
+                    {"text": DELETE_BUTTON_TEXT, "callback_data": delete},
                 ]
             )
 
@@ -1332,17 +1354,8 @@ def build_inbox_promote_replies(config: dict[str, str]) -> list[Reply]:
     if not results:
         return [(INBOX_NOTHING_TO_PROMOTE_TEXT.format(min_seen=INBOX_PROMOTE_MIN_SEEN), None)]
 
-    moved = [html.escape(word) for word, result in results if result and result.status == STATUS_CREATED]
-    failed = [html.escape(word) for word, result in results if not result or result.status != STATUS_CREATED]
-
-    lines = []
-    if moved:
-        lines.append(f"✅ Sent to Mochi: {', '.join(moved)}")
-    if failed:
-        lines.append(f"{BULK_AI_FAILED_LABEL}: {', '.join(failed)}")
-
     # Fresh list so leftovers (or the next batch) can be handled right away.
-    return [("\n".join(lines), None), build_inbox_reply(config)]
+    return build_word_replies(results) + [build_inbox_reply(config)]
 
 
 def process_telegram_text(
@@ -1494,7 +1507,7 @@ def handle_edit_card_answer(
         config=config,
     )
     clear_session(str(session["telegram_user_id"]))
-    return build_add_result_reply(result, title="Updated")
+    return build_add_result_reply(result)
 
 
 # ---------------------------------------------------------------------------
@@ -1543,7 +1556,7 @@ def dispatch_callback(data: str, user_id: str, config: dict[str, str]) -> list[R
 
     if data.startswith(CALLBACK_REGEN_PREFIX):
         result = regenerate_card(data[len(CALLBACK_REGEN_PREFIX):], config)
-        return [build_add_result_reply(result, title="Regenerated")]
+        return [build_add_result_reply(result)]
 
     if data.startswith(CALLBACK_EDIT_PREFIX):
         return [start_edit_card_session(data[len(CALLBACK_EDIT_PREFIX):], user_id, config)]

@@ -15,7 +15,7 @@ The bot does not run its own practice or reviews, and does not send reminders.
 
 ## Commands
 
-- `/ai word_or_phrase` - generate a card **draft** with Gemini; buttons `📚 To Mochi` / `📥 Inbox` decide where it goes. Without a button press the word is not sent anywhere.
+- `/ai word_or_phrase` - generate a card **draft** with Gemini; buttons `To Mochi` / `Inbox` decide where it goes. Without a button press the word is not sent anywhere.
 - `/mochi word_or_phrase` - generate a card and send it straight to Mochi
 - `/inbox word_or_phrase` - generate a card and park it in the inbox (not in Mochi)
 - `/inbox` - list inbox words, most-seen first
@@ -23,7 +23,7 @@ The bot does not run its own practice or reviews, and does not send reminders.
 - `/delete word` - delete the local record and, if it is in Mochi, the Mochi card
 - `/cancel` - cancel the current edit session
 
-`/ai`, `/mochi` and `/inbox` accept several words: one per line or separated by `;`, up to 10. Each word gets its own reply with its own buttons; words that are already saved do not spend a Gemini call.
+`/ai`, `/mochi` and `/inbox` accept several words: one per line or separated by `;`, up to 10. Words that were just sent to Mochi or Inbox are confirmed in one message (`✓ word → Mochi`); drafts and already saved words get their own card with buttons. Words that are already saved do not spend a Gemini call.
 
 Practice commands (`/today`, `/stats`) and older review modes (`/practice`, `/weak`) were removed; sending them shows the help.
 
@@ -34,7 +34,7 @@ Each word in DynamoDB has a `status`:
 - `DRAFT` - generated, not sent anywhere yet
 - `INBOX` - parked; not in Mochi
 - `RESERVED` -> `CREATED` - being sent to / now in Mochi
-- `FAILED` - the Mochi request failed; `📚 To Mochi` retries it
+- `FAILED` - the Mochi request failed; `To Mochi` retries it
 
 Gemini also estimates `frequency` (`common` / `moderate` / `rare`) and a CEFR `level`. Both are shown in Telegram and added as Mochi tags (`freq-common`, `b2`).
 
@@ -42,9 +42,9 @@ Sighting counter: adding a word again while it is a draft or in the inbox increm
 
 Getting words out of the inbox:
 
-- `📚 To Mochi` on a card or next to a word in `/inbox`
-- `🗑` next to a word in `/inbox`
-- `📚 Move seen 2+ times to Mochi` under `/inbox` - sends up to 10 such words per press
+- `To Mochi` on a card or next to a word in `/inbox`
+- `Delete` next to a word in `/inbox`
+- `Move seen 2+ times to Mochi` under `/inbox` - sends up to 10 such words per press
 - `/mochi word` for a word that is already in the inbox moves it to Mochi
 
 Regenerate and Edit change Mochi only for words that are already there; drafts and inbox words stay local. `POST /add-card` still sends straight to Mochi.
@@ -76,8 +76,8 @@ This overwrites Telegram's bot command list with the current commands and remove
 
 1. `/ai reliable` - a draft with frequency/level and `To Mochi` / `Inbox` buttons; nothing appears in Mochi.
 2. `/ai reliable` again - "seen 2×".
-3. Tap `📥 Inbox`, then `/inbox` - the word is listed with `seen 2×` and the promote button.
-4. Tap `📚 Move seen 2+ times to Mochi` - the card appears in Mochi with `freq-*` and level tags.
+3. Tap `Inbox`, then `/inbox` - the word is listed with `seen 2×` and the promote button.
+4. Tap `Move seen 2+ times to Mochi` - the card appears in Mochi with `freq-*` and level tags.
 5. `/mochi` with several words on separate lines - one reply per word, all in Mochi.
 6. Tap `Edit` on an inbox word and send `word | translation | usage | example` - Mochi is not touched.
 7. Send `/today` - the bot replies with help.

@@ -96,8 +96,9 @@ class AddAiCardsTests(unittest.TestCase):
         self.assertEqual(sorted(call.args[0] for call in generate.call_args_list), ["broken", "so far"])
 
         replies = main.build_word_replies(results)
+        # The failure is one summary line; the inbox word and the draft keep their cards.
         self.assertEqual(len(replies), 3)
-        self.assertIn("❌ Failed: <b>broken</b>", replies[2][0])
+        self.assertEqual(replies[0], ("✗ <b>broken</b> — failed, try again", None))
 
 
 class HandleExistingWordTests(unittest.TestCase):
@@ -128,14 +129,36 @@ class HandleExistingWordTests(unittest.TestCase):
 
 
 class CardReplyTests(unittest.TestCase):
-    def test_draft_has_mochi_and_inbox_buttons(self):
+    def test_draft_card_is_plain_with_mochi_and_inbox_buttons(self):
         text, keyboard = main.build_add_result_reply(
-            main.AddCardResult(created=True, word="reliable", status=main.STATUS_DRAFT, frequency="common", level="B2")
+            main.AddCardResult(
+                created=True,
+                word="infuse",
+                status=main.STATUS_DRAFT,
+                translation="наполнять",
+                example="She infuses her tea.",
+                frequency="moderate",
+                level="C1",
+            )
         )
-        self.assertIn(main.DRAFT_HINT_TEXT, text)
-        self.assertIn("common · B2", text)
+        self.assertEqual(text, "<b>infuse</b>\nнаполнять\n<i>She infuses her tea.</i>\nmoderate · C1")
         self.assertIn(main.TO_MOCHI_BUTTON_TEXT, buttons(keyboard))
         self.assertIn(main.TO_INBOX_BUTTON_TEXT, buttons(keyboard))
+
+    def test_just_sent_word_is_a_single_line_without_buttons(self):
+        for status, destination in ((main.STATUS_CREATED, "Mochi"), (main.STATUS_INBOX, "Inbox")):
+            reply = main.build_add_result_reply(main.AddCardResult(created=True, word="beneath", status=status))
+            self.assertEqual(reply, (f"✓ <b>beneath</b> → {destination}", None))
+
+    def test_several_sent_words_share_one_message(self):
+        results = [
+            (word, main.AddCardResult(created=True, word=word, status=main.STATUS_CREATED))
+            for word in ("beneath", "infuse")
+        ]
+        self.assertEqual(
+            main.build_word_replies(results),
+            [("✓ <b>beneath</b> → Mochi\n✓ <b>infuse</b> → Mochi", None)],
+        )
 
     def test_inbox_word_seen_often_suggests_mochi(self):
         text, keyboard = main.build_add_result_reply(
@@ -144,16 +167,26 @@ class CardReplyTests(unittest.TestCase):
             )
         )
         self.assertIn(main.INBOX_SUGGEST_TEXT, text)
-        self.assertIn(f"seen {main.INBOX_SUGGEST_SEEN_COUNT}×", text)
+        self.assertIn(f"in inbox · seen {main.INBOX_SUGGEST_SEEN_COUNT}×", text)
         self.assertIn(main.TO_MOCHI_BUTTON_TEXT, buttons(keyboard))
         self.assertNotIn(main.TO_INBOX_BUTTON_TEXT, buttons(keyboard))
 
-    def test_word_in_mochi_has_only_card_actions(self):
+    def test_word_already_in_mochi_shows_card_with_card_actions(self):
         text, keyboard = main.build_add_result_reply(
             main.AddCardResult(created=False, word="reliable", status=main.STATUS_CREATED)
         )
-        self.assertIn(main.ALREADY_IN_MOCHI_TITLE, text)
+        self.assertIn("in Mochi", text)
         self.assertEqual(buttons(keyboard), [main.REGENERATE_BUTTON_TEXT, main.EDIT_BUTTON_TEXT, main.DELETE_BUTTON_TEXT])
+
+    def test_replies_have_no_decorative_emoji(self):
+        texts = [
+            main.TO_MOCHI_BUTTON_TEXT,
+            main.TO_INBOX_BUTTON_TEXT,
+            main.INBOX_PROMOTE_BUTTON_TEXT,
+            *main.WORD_STATUS_LABELS.values(),
+        ]
+        for text in texts:
+            self.assertTrue(all(ord(char) < 0x2000 for char in text), text)
 
 
 class InboxTests(unittest.TestCase):
@@ -161,9 +194,10 @@ class InboxTests(unittest.TestCase):
         items = [make_item("reliable", main.STATUS_INBOX, 3), make_item("so far", main.STATUS_INBOX)]
         with patch.object(main, "scan_inbox_items", return_value=items):
             text, keyboard = main.build_inbox_reply({})
-        self.assertIn("📥 Inbox: 2", text)
+        self.assertIn("<b>Inbox</b> · 2", text)
         self.assertIn("seen 3×", text)
-        self.assertIn(f"{main.TO_MOCHI_BUTTON_TEXT}: reliable", buttons(keyboard))
+        self.assertNotIn("in inbox", text)
+        self.assertIn("reliable → Mochi", buttons(keyboard))
         self.assertEqual(keyboard["inline_keyboard"][-1][0]["callback_data"], main.CALLBACK_INBOX_PROMOTE)
 
     def test_promote_sends_only_words_seen_enough(self):

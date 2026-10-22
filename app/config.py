@@ -138,7 +138,6 @@ HELP_TEXT = (
 GENERIC_ERROR_TEXT = "Something went wrong. Please try again later."
 AI_ERROR_TEXT = "AI could not complete this request. Please try again later."
 BULK_AI_TOO_MANY_TEXT = "Up to {limit} words at a time, please. You sent {count}."
-BULK_AI_FAILED_LABEL = "❌ Failed"
 
 EDIT_CARD_PROMPT = (
     "Send the updated card in this format:\n\n"
@@ -162,10 +161,10 @@ EDIT_BUTTON_TEXT = "Edit"
 DELETE_BUTTON_TEXT = "Delete"
 CONFIRM_DELETE_BUTTON_TEXT = "Yes, delete"
 CANCEL_BUTTON_TEXT = "Cancel"
-TO_MOCHI_BUTTON_TEXT = "📚 To Mochi"
-TO_INBOX_BUTTON_TEXT = "📥 Inbox"
-INBOX_PROMOTE_BUTTON_TEXT = "📚 Move seen {min_seen}+ times to Mochi"
-INBOX_DELETE_BUTTON_TEXT = "🗑"
+TO_MOCHI_BUTTON_TEXT = "To Mochi"
+TO_INBOX_BUTTON_TEXT = "Inbox"
+INBOX_WORD_TO_MOCHI_BUTTON_TEXT = "{word} → Mochi"
+INBOX_PROMOTE_BUTTON_TEXT = "Move seen {min_seen}+ times to Mochi"
 
 CALLBACK_REGEN_PREFIX = "regen:"
 CALLBACK_EDIT_PREFIX = "edit:"
@@ -180,17 +179,22 @@ TELEGRAM_CALLBACK_DATA_MAX_BYTES = 64
 WORD_NOT_FOUND_TEXT = "Word not found."
 INBOX_EMPTY_TEXT = "Inbox is empty."
 INBOX_NOTHING_TO_PROMOTE_TEXT = "No inbox words seen {min_seen}+ times."
-DRAFT_HINT_TEXT = "Not saved to Mochi or Inbox yet — pick one below."
-INBOX_SUGGEST_TEXT = "Keeps coming up — maybe time to send it to Mochi?"
+INBOX_SUGGEST_TEXT = "Keeps coming up — maybe send it to Mochi?"
 
-WORD_STATUS_TITLES = {
-    STATUS_DRAFT: "📝 Draft",
-    STATUS_INBOX: "📥 In inbox",
-    STATUS_RESERVED: "⏳ Sending to Mochi",
-    STATUS_CREATED: "✅ In Mochi",
-    STATUS_FAILED: "⚠️ Mochi request failed",
+# Just sent somewhere: one line "✓ word → Mochi" instead of the whole card.
+ADDED_LINE = "✓ <b>{word}</b> → {destination}"
+FAILED_LINE = "✗ <b>{word}</b> — failed, try again"
+DESTINATION_LABELS = {
+    STATUS_CREATED: "Mochi",
+    STATUS_INBOX: "Inbox",
 }
-ALREADY_IN_MOCHI_TITLE = "🔁 Already in Mochi"
+# Shown in a card's meta line; drafts have no label (their buttons say it all).
+WORD_STATUS_LABELS = {
+    STATUS_INBOX: "in inbox",
+    STATUS_RESERVED: "sending to Mochi",
+    STATUS_CREATED: "in Mochi",
+    STATUS_FAILED: "Mochi request failed",
+}
 CANCELLED_TEXT = "Cancelled."
 
 # Front side: only the word (H2 so it is not oversized). Back side: translation
