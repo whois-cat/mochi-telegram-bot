@@ -141,7 +141,10 @@ class CardReplyTests(unittest.TestCase):
                 level="C1",
             )
         )
-        self.assertEqual(text, "<b>infuse</b>\nнаполнять\n<i>She infuses her tea.</i>\nmoderate · C1")
+        self.assertEqual(
+            text,
+            "<b>infuse</b> — наполнять\n<blockquote>She infuses her tea.</blockquote>\n<i>moderate · C1</i>",
+        )
         self.assertIn(main.TO_MOCHI_BUTTON_TEXT, buttons(keyboard))
         self.assertIn(main.TO_INBOX_BUTTON_TEXT, buttons(keyboard))
 
@@ -167,7 +170,7 @@ class CardReplyTests(unittest.TestCase):
             )
         )
         self.assertIn(main.INBOX_SUGGEST_TEXT, text)
-        self.assertIn(f"in inbox · seen {main.INBOX_SUGGEST_SEEN_COUNT}×", text)
+        self.assertIn(f"in inbox · looked up {main.INBOX_SUGGEST_SEEN_COUNT} times", text)
         self.assertIn(main.TO_MOCHI_BUTTON_TEXT, buttons(keyboard))
         self.assertNotIn(main.TO_INBOX_BUTTON_TEXT, buttons(keyboard))
 
@@ -195,7 +198,7 @@ class InboxTests(unittest.TestCase):
         with patch.object(main, "scan_inbox_items", return_value=items):
             text, keyboard = main.build_inbox_reply({})
         self.assertIn("<b>Inbox</b> · 2", text)
-        self.assertIn("seen 3×", text)
+        self.assertIn("looked up 3 times", text)
         self.assertNotIn("in inbox", text)
         self.assertIn("reliable → Mochi", buttons(keyboard))
         self.assertEqual(keyboard["inline_keyboard"][-1][0]["callback_data"], main.CALLBACK_INBOX_PROMOTE)

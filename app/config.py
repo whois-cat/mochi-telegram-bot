@@ -180,6 +180,8 @@ WORD_NOT_FOUND_TEXT = "Word not found."
 INBOX_EMPTY_TEXT = "Inbox is empty."
 INBOX_NOTHING_TO_PROMOTE_TEXT = "No inbox words seen {min_seen}+ times."
 INBOX_SUGGEST_TEXT = "Keeps coming up — maybe send it to Mochi?"
+# seen_count in the meta line: how many times the word was added.
+SEEN_COUNT_TEXT = "looked up {count} times"
 
 # Just sent somewhere: one line "✓ word → Mochi" instead of the whole card.
 ADDED_LINE = "✓ <b>{word}</b> → {destination}"

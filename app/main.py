@@ -67,6 +67,7 @@ from app.config import (
     MOCHI_TIMEOUT_SECONDS,
     REGENERATE_BUTTON_TEXT,
     SESSION_STATUS_ACTIVE,
+    SEEN_COUNT_TEXT,
     SESSION_TYPE_EDIT,
     STATUS_CREATED,
     STATUS_DRAFT,
@@ -1240,10 +1241,10 @@ def extract_telegram_message(update: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def format_word_meta(*, frequency: str, level: str, status: str, seen_count: int) -> str:
-    """E.g. "common · B2 · in inbox · seen 3×"; empty when there is nothing to show."""
+    """E.g. "common · B2 · in inbox · looked up 3 times"; empty when there is nothing to show."""
     parts = [part for part in (frequency, level, WORD_STATUS_LABELS.get(status, "")) if part]
     if seen_count > 1:
-        parts.append(f"seen {seen_count}×")
+        parts.append(SEEN_COUNT_TEXT.format(count=seen_count))
     return " · ".join(parts)
 
 
@@ -1265,11 +1266,13 @@ def build_add_result_reply(result: AddCardResult) -> Reply:
     if is_just_added(result):
         return build_added_line(result), None
 
-    lines = [f"<b>{html.escape(result.word)}</b>"]
+    # Word and translation on one line, the example as a quote, meta as an italic caption.
+    header = f"<b>{html.escape(result.word)}</b>"
     if result.translation:
-        lines.append(html.escape(result.translation))
+        header += f" — {html.escape(result.translation)}"
+    lines = [header]
     if result.example:
-        lines.append(f"<i>{html.escape(result.example)}</i>")
+        lines.append(f"<blockquote>{html.escape(result.example)}</blockquote>")
 
     meta = format_word_meta(
         frequency=result.frequency,
@@ -1278,7 +1281,7 @@ def build_add_result_reply(result: AddCardResult) -> Reply:
         seen_count=result.seen_count,
     )
     if meta:
-        lines.append(html.escape(meta))
+        lines.append(f"<i>{html.escape(meta)}</i>")
     if result.status in (STATUS_DRAFT, STATUS_INBOX) and result.seen_count >= INBOX_SUGGEST_SEEN_COUNT:
         lines.append(INBOX_SUGGEST_TEXT)
 

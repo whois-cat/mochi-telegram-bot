@@ -75,8 +75,8 @@ This overwrites Telegram's bot command list with the current commands and remove
 ## Manual Test Checklist
 
 1. `/ai reliable` - a draft with frequency/level and `To Mochi` / `Inbox` buttons; nothing appears in Mochi.
-2. `/ai reliable` again - "seen 2×".
-3. Tap `Inbox`, then `/inbox` - the word is listed with `seen 2×` and the promote button.
+2. `/ai reliable` again - "looked up 2 times".
+3. Tap `Inbox`, then `/inbox` - the word is listed with `looked up 2 times` and the promote button.
 4. Tap `Move seen 2+ times to Mochi` - the card appears in Mochi with `freq-*` and level tags.
 5. `/mochi` with several words on separate lines - one reply per word, all in Mochi.
 6. Tap `Edit` on an inbox word and send `word | translation | usage | example` - Mochi is not touched.
