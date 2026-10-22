@@ -98,7 +98,7 @@ class AddAiCardsTests(unittest.TestCase):
         replies = main.build_word_replies(results)
         # The failure is one summary line; the inbox word and the draft keep their cards.
         self.assertEqual(len(replies), 3)
-        self.assertEqual(replies[0], ("✗ <b>broken</b> — failed, try again", None))
+        self.assertEqual(replies[0], ("❌ <b>broken</b> — failed, try again", None))
 
 
 class HandleExistingWordTests(unittest.TestCase):
@@ -151,7 +151,7 @@ class CardReplyTests(unittest.TestCase):
     def test_just_sent_word_is_a_single_line_without_buttons(self):
         for status, destination in ((main.STATUS_CREATED, "Mochi"), (main.STATUS_INBOX, "Inbox")):
             reply = main.build_add_result_reply(main.AddCardResult(created=True, word="beneath", status=status))
-            self.assertEqual(reply, (f"✓ <b>beneath</b> → {destination}", None))
+            self.assertEqual(reply, (f"✅ <b>beneath</b> → {destination}", None))
 
     def test_several_sent_words_share_one_message(self):
         results = [
@@ -160,7 +160,7 @@ class CardReplyTests(unittest.TestCase):
         ]
         self.assertEqual(
             main.build_word_replies(results),
-            [("✓ <b>beneath</b> → Mochi\n✓ <b>infuse</b> → Mochi", None)],
+            [("✅ <b>beneath</b> → Mochi\n✅ <b>infuse</b> → Mochi", None)],
         )
 
     def test_inbox_word_seen_often_suggests_mochi(self):

@@ -183,9 +183,9 @@ INBOX_SUGGEST_TEXT = "Keeps coming up — maybe send it to Mochi?"
 # seen_count in the meta line: how many times the word was added.
 SEEN_COUNT_TEXT = "looked up {count} times"
 
-# Just sent somewhere: one line "✓ word → Mochi" instead of the whole card.
-ADDED_LINE = "✓ <b>{word}</b> → {destination}"
-FAILED_LINE = "✗ <b>{word}</b> — failed, try again"
+# Just sent somewhere: one line "✅ word → Mochi" instead of the whole card.
+ADDED_LINE = "✅ <b>{word}</b> → {destination}"
+FAILED_LINE = "❌ <b>{word}</b> — failed, try again"
 DESTINATION_LABELS = {
     STATUS_CREATED: "Mochi",
     STATUS_INBOX: "Inbox",

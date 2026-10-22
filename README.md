@@ -23,7 +23,7 @@ The bot does not run its own practice or reviews, and does not send reminders.
 - `/delete word` - delete the local record and, if it is in Mochi, the Mochi card
 - `/cancel` - cancel the current edit session
 
-`/ai`, `/mochi` and `/inbox` accept several words: one per line or separated by `;`, up to 10. Words that were just sent to Mochi or Inbox are confirmed in one message (`✓ word → Mochi`); drafts and already saved words get their own card with buttons. Words that are already saved do not spend a Gemini call.
+`/ai`, `/mochi` and `/inbox` accept several words: one per line or separated by `;`, up to 10. Words that were just sent to Mochi or Inbox are confirmed in one message (`✅ word → Mochi`); drafts and already saved words get their own card with buttons. Words that are already saved do not spend a Gemini call.
 
 Practice commands (`/today`, `/stats`) and older review modes (`/practice`, `/weak`) were removed; sending them shows the help.
 
