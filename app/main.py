@@ -1266,11 +1266,10 @@ def build_add_result_reply(result: AddCardResult) -> Reply:
     if is_just_added(result):
         return build_added_line(result), None
 
-    # Word and translation on one line, the example as a quote, meta as an italic caption.
-    header = f"<b>{html.escape(result.word)}</b>"
+    # Word, translation below it, the example as a quote, meta as an italic caption.
+    lines = [f"<b>{html.escape(result.word)}</b>"]
     if result.translation:
-        header += f" — {html.escape(result.translation)}"
-    lines = [header]
+        lines.append(html.escape(result.translation))
     if result.example:
         lines.append(f"<blockquote>{html.escape(result.example)}</blockquote>")
 

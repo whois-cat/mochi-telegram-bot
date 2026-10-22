@@ -143,7 +143,7 @@ class CardReplyTests(unittest.TestCase):
         )
         self.assertEqual(
             text,
-            "<b>infuse</b> — наполнять\n<blockquote>She infuses her tea.</blockquote>\n<i>moderate · C1</i>",
+            "<b>infuse</b>\nнаполнять\n<blockquote>She infuses her tea.</blockquote>\n<i>moderate · C1</i>",
         )
         self.assertIn(main.TO_MOCHI_BUTTON_TEXT, buttons(keyboard))
         self.assertIn(main.TO_INBOX_BUTTON_TEXT, buttons(keyboard))
