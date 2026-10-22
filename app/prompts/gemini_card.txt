@@ -8,14 +8,18 @@ Required JSON schema:
   "translation": "short Russian translation",
   "usage": "noun | verb | adjective | adverb | phrase | phrasal verb | idiom | collocation | ...",
   "example": "one natural English sentence",
-  "cloze_sentence": "one natural English sentence where the word or phrase appears in its exact base form"
+  "frequency": "common | moderate | rare",
+  "level": "A1 | A2 | B1 | B2 | C1 | C2"
 }
 
 Rules:
 - "translation" must be in Russian.
 - "example" must be a natural English sentence at B1-B2 level.
-- "cloze_sentence" must be a natural English sentence at B1-B2 level.
-- "cloze_sentence" must contain the exact value of "word" as written in the JSON, not an inflected, conjugated, plural, or derived form.
 - "usage" must be concise (one or two words).
+- "frequency" is how often a B2 learner would meet this exact word or phrase in everyday English (conversations, series, news, the internet):
+  - "common": meets it every week or so;
+  - "moderate": meets it now and then, worth knowing;
+  - "rare": bookish, technical, dated, or very niche.
+- "level" is the CEFR level at which learners usually learn this word or phrase.
 
 Word or phrase: {word}

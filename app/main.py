@@ -4,95 +4,88 @@ import base64
 import hmac
 import html
 import json
-import random
 import re
 import time
 import unicodedata
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from typing import Any
 
 import boto3
 import requests
+from boto3.dynamodb.conditions import Attr
 from botocore.exceptions import ClientError
 
-from app.keyboards import build_help_menu, build_inline_keyboard, build_practice_task_keyboard
+from app.keyboards import build_help_menu, build_inline_keyboard
 from app.config import (
+    AI_COMMAND_DESTINATIONS,
+    AI_ERROR_TEXT,
+    ALREADY_IN_MOCHI_TITLE,
+    BULK_AI_FAILED_LABEL,
+    BULK_AI_LIST_MARKER_PATTERN,
+    BULK_AI_MAX_WORDS,
+    BULK_AI_MAX_WORKERS,
+    BULK_AI_SEPARATORS_PATTERN,
+    BULK_AI_TOO_MANY_TEXT,
     CALLBACK_CANCEL,
     CALLBACK_DELETE_CONFIRM_PREFIX,
     CALLBACK_DELETE_PREFIX,
     CALLBACK_EDIT_PREFIX,
-    CALLBACK_PRACTICE_HINT,
-    CALLBACK_PRACTICE_IDK,
+    CALLBACK_INBOX_PROMOTE,
     CALLBACK_REGEN_PREFIX,
-    CANCEL_BUTTON_TEXT,
+    CALLBACK_TO_INBOX_PREFIX,
+    CALLBACK_TO_MOCHI_PREFIX,
     CANCELLED_TEXT,
-    CLOZE_BLANK,
+    CANCEL_BUTTON_TEXT,
+    CEFR_LEVELS,
     CONFIRM_DELETE_BUTTON_TEXT,
     DELETE_BUTTON_TEXT,
+    DESTINATION_INBOX,
+    DESTINATION_MOCHI,
+    DRAFT_HINT_TEXT,
     EDIT_BUTTON_TEXT,
     EDIT_CARD_PROMPT,
+    EDIT_SESSION_TTL_SECONDS,
+    FREQUENCY_VALUES,
     GEMINI_TIMEOUT_MS,
     GENERIC_ERROR_TEXT,
     HELP_TEXT,
+    INBOX_DELETE_BUTTON_TEXT,
+    INBOX_EMPTY_TEXT,
+    INBOX_LIST_LIMIT,
+    INBOX_NOTHING_TO_PROMOTE_TEXT,
+    INBOX_PROMOTE_BATCH,
+    INBOX_PROMOTE_BUTTON_TEXT,
+    INBOX_PROMOTE_MIN_SEEN,
+    INBOX_SUGGEST_SEEN_COUNT,
+    INBOX_SUGGEST_TEXT,
     LEGACY_CARD_SRS_ATTRIBUTES,
     MOCHI_API_URL,
     MOCHI_CARD_TEMPLATE,
     MOCHI_TIMEOUT_SECONDS,
-    NOT_ENOUGH_WORDS_TEXT,
-    PRACTICE_CORRECT_INTERVAL_STEPS,
-    PRACTICE_MAX_PRIORITY_SCORE,
-    PRACTICE_BLOCK_QUESTION_COUNT,
-    PRACTICE_MODE_TODAY,
-    PRACTICE_QUESTION_COUNT,
-    PRACTICE_SCAN_LIMIT,
-    PRACTICE_SESSION_TTL_SECONDS,
-    PRACTICE_SESSION_TYPE_ACTIVE,
-    PRACTICE_SESSION_TYPE_EDIT,
     REGENERATE_BUTTON_TEXT,
-    RESULT_CORRECT,
-    RESULT_HINT_REQUESTED,
-    RESULT_IDK,
-    RESULT_MINOR_ISSUE,
-    RESULT_SKIPPED,
-    RESULT_WRONG,
     SESSION_STATUS_ACTIVE,
-    STATS_SCAN_LIMIT,
+    SESSION_TYPE_EDIT,
     STATUS_CREATED,
+    STATUS_DRAFT,
     STATUS_FAILED,
+    STATUS_INBOX,
     STATUS_RESERVED,
-    TASK_TYPE_FILL_BLANK,
-    TASK_TYPE_OWN_SENTENCE,
-    TASK_TYPE_TRANSLATE_RU_EN,
-    TELEGRAM_BOT_COMMANDS,
-    TODAY_PRACTICE_INTRO,
     TELEGRAM_API_BASE,
+    TELEGRAM_BOT_COMMANDS,
     TELEGRAM_CALLBACK_DATA_MAX_BYTES,
     TELEGRAM_TIMEOUT_SECONDS,
+    TO_INBOX_BUTTON_TEXT,
+    TO_MOCHI_BUTTON_TEXT,
     USAGE_ALIASES,
     WORD_NOT_FOUND_TEXT,
+    WORD_STATUS_TITLES,
     get_app_config,
     get_known_words_table_name,
     get_practice_sessions_table_name,
     load_prompt,
-)
-from app.services.evaluator import (
-    evaluate_short_answer_locally,
-    format_own_sentence_feedback,
-    precheck_own_sentence,
-    precheck_translation,
-)
-from app.services.hint_service import build_hint, is_hint_text, is_idk_text
-from app.services.normalization import contains_target_phrase, get_normalized_variants, normalize_text
-from app.services.task_generator import build_task_prompt
-from app.storage.sessions_repo import (
-    COMPACT_STORAGE_VERSION,
-    advance_session,
-    get_task as get_compact_task,
-    get_tasks as get_compact_tasks,
-    mark_session_status,
-    save_practice_session,
-    save_task_result,
 )
 
 try:
@@ -131,22 +124,29 @@ class CardInput:
     translation: str
     usage: str
     example: str
-    cloze_sentence: str | None = None
+    frequency: str = ""
+    level: str = ""
 
 
 @dataclass(frozen=True)
 class AddCardResult:
+    # created: this request created the word or moved it to a new status.
     created: bool
     word: str
+    status: str = STATUS_CREATED
     mochi_card_id: str | None = None
     translation: str | None = None
     example: str | None = None
+    frequency: str = ""
+    level: str = ""
+    seen_count: int = 1
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "ok": True,
             "created": self.created,
             "word": self.word,
+            "status": self.status,
             "mochi_card_id": self.mochi_card_id,
             "message": "Card added to Mochi" if self.created else "Card already exists",
         }
@@ -154,9 +154,15 @@ class AddCardResult:
 
 @dataclass(frozen=True)
 class TelegramCommand:
-    mode: str  # "manual" | "ai" | "help" | "practice_today" | "stats" | "cancel"
+    mode: str  # "manual" | "ai" | "inbox_list" | "delete" | "help" | "cancel"
     card: CardInput | None = None
     query: str | None = None
+    queries: tuple[str, ...] = ()
+    destination: str | None = None  # DESTINATION_MOCHI | DESTINATION_INBOX | None (draft)
+
+
+# One Telegram message: (html_text, reply_markup or None).
+Reply = tuple[str, "dict[str, Any] | None"]
 
 
 # ---------------------------------------------------------------------------
@@ -167,6 +173,16 @@ class TelegramCommand:
 def log_event(message: str, **fields: Any) -> None:
     """Structured log line. Never pass secrets, headers, bodies or payloads."""
     print(json.dumps({"message": message, **fields}, ensure_ascii=False))
+
+
+def log_gemini_request_error(error: Exception) -> None:
+    # code/status exist only on google.genai APIError, not on timeouts/network errors.
+    log_event(
+        "gemini_request_error",
+        error_type=type(error).__name__,
+        code=getattr(error, "code", None),
+        status=getattr(error, "status", None),
+    )
 
 
 def log_safe_request(event: dict[str, Any]) -> None:
@@ -245,19 +261,6 @@ def require_string_field(data: dict[str, Any], field_name: str) -> str:
     return value.strip()
 
 
-def optional_string_field(data: dict[str, Any], field_name: str) -> str | None:
-    value = data.get(field_name)
-
-    if value is None:
-        return None
-
-    if not isinstance(value, str):
-        raise HttpError(400, f"Field '{field_name}' must be a string")
-
-    value = value.strip()
-    return value or None
-
-
 # ---------------------------------------------------------------------------
 # Normalization helpers
 # ---------------------------------------------------------------------------
@@ -271,24 +274,6 @@ def normalize_usage_tag(usage: str) -> str:
 def normalize_word_for_lookup(value: str) -> str:
     normalized = unicodedata.normalize("NFKC", value).strip().lower()
     return " ".join(normalized.split())
-
-
-def sentence_has_exact_word(word: str, sentence: str) -> bool:
-    if not word or not sentence:
-        return False
-
-    pattern = rf"(?<!\w){re.escape(word)}(?!\w)"
-    return re.search(pattern, sentence, flags=re.IGNORECASE) is not None
-
-
-def infer_cloze_sentence(card: CardInput) -> str | None:
-    if card.cloze_sentence and sentence_has_exact_word(card.word, card.cloze_sentence):
-        return card.cloze_sentence
-
-    if sentence_has_exact_word(card.word, card.example):
-        return card.example
-
-    return None
 
 
 def build_word_key(*, deck_id: str, normalized_word: str) -> str:
@@ -327,71 +312,132 @@ def get_known_word(word: str, config: dict[str, str]) -> dict[str, Any] | None:
     return response.get("Item")
 
 
-def reserve_known_word(
+def put_new_known_word(
     *,
-    word: str,
-    translation: str,
-    example: str,
-    cloze_sentence: str | None,
+    card: CardInput,
     usage_tag: str,
+    status: str,
     source: str,
     config: dict[str, str],
-) -> dict[str, Any]:
+) -> dict[str, Any] | None:
     """
-    Atomically reserve the word. Succeeds when the item does not exist or its
-    previous attempt FAILED (retry). Returns {"reserved": bool, "item": dict}.
+    Store a new word as DRAFT or INBOX. Succeeds when the item does not exist or
+    its previous Mochi attempt FAILED (retry). None when the word already exists.
     """
-    table = get_known_words_table()
-    normalized_word = normalize_word_for_lookup(word)
-    word_key = build_word_key(
-        deck_id=config["MOCHI_DECK_ID"],
-        normalized_word=normalized_word,
-    )
+    normalized_word = normalize_word_for_lookup(card.word)
     now = utc_now_iso()
 
     item = {
-        "word_key": word_key,
+        "word_key": build_word_key(deck_id=config["MOCHI_DECK_ID"], normalized_word=normalized_word),
         "deck_id": config["MOCHI_DECK_ID"],
         "normalized_word": normalized_word,
-        "word": word,
-        "translation": translation,
-        "example": example,
+        "word": card.word,
+        "translation": card.translation,
+        "example": card.example,
         "usage_tag": usage_tag,
+        "frequency": card.frequency,
+        "level": card.level,
         "source": source,
-        "status": STATUS_RESERVED,
+        "status": status,
+        "seen_count": 1,
         "created_at": now,
         "updated_at": now,
-        "practice_attempt_count": 0,
-        "correct_count": 0,
-        "wrong_count": 0,
-        "minor_issue_count": 0,
-        "practice_score": 0,
-        "practice_interval_days": 0,
-        "next_practice_at": now,
+        "last_seen_at": now,
     }
-    if cloze_sentence:
-        item["cloze_sentence"] = cloze_sentence
 
     try:
-        table.put_item(
+        get_known_words_table().put_item(
             Item=item,
             ConditionExpression="attribute_not_exists(word_key) OR #status = :failed",
             ExpressionAttributeNames={"#status": "status"},
             ExpressionAttributeValues={":failed": STATUS_FAILED},
         )
-        return {"reserved": True, "item": item}
+        return item
 
     except ClientError as error:
-        error_code = error.response.get("Error", {}).get("Code")
-        if error_code != "ConditionalCheckFailedException":
+        if error.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
             raise
+        return None
 
-        existing = table.get_item(
+
+def record_sighting(word_key: str) -> dict[str, Any]:
+    """The word was added again while still a draft or in inbox: count it."""
+    now = utc_now_iso()
+    return get_known_words_table().update_item(
+        Key={"word_key": word_key},
+        UpdateExpression="SET last_seen_at = :now, updated_at = :now ADD seen_count :one",
+        ExpressionAttributeValues={":now": now, ":one": 1},
+        ReturnValues="ALL_NEW",
+    )["Attributes"]
+
+
+def set_known_word_status(
+    word_key: str,
+    *,
+    status: str,
+    from_statuses: tuple[str, ...],
+) -> dict[str, Any] | None:
+    """Atomic status change; None when the word is missing or not in from_statuses."""
+    placeholders = {f":from{index}": value for index, value in enumerate(from_statuses)}
+
+    try:
+        return get_known_words_table().update_item(
             Key={"word_key": word_key},
-            ConsistentRead=True,
-        ).get("Item")
+            UpdateExpression="SET #status = :status, updated_at = :updated_at",
+            ConditionExpression=f"#status IN ({', '.join(placeholders)})",
+            ExpressionAttributeNames={"#status": "status"},
+            ExpressionAttributeValues={":status": status, ":updated_at": utc_now_iso(), **placeholders},
+            ReturnValues="ALL_NEW",
+        )["Attributes"]
 
-        return {"reserved": False, "item": existing or {"word_key": word_key, "word": word}}
+    except ClientError as error:
+        if error.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+            raise
+        return None
+
+
+def scan_inbox_items(config: dict[str, str]) -> list[dict[str, Any]]:
+    """Most-seen first, then oldest. Scan is fine here: small personal table."""
+    table = get_known_words_table()
+    scan_kwargs: dict[str, Any] = {
+        "FilterExpression": Attr("status").eq(STATUS_INBOX) & Attr("deck_id").eq(config["MOCHI_DECK_ID"]),
+    }
+    items: list[dict[str, Any]] = []
+
+    while True:
+        response = table.scan(**scan_kwargs)
+        items.extend(response.get("Items", []))
+        if "LastEvaluatedKey" not in response:
+            break
+        scan_kwargs["ExclusiveStartKey"] = response["LastEvaluatedKey"]
+
+    items.sort(key=lambda item: (-int(item.get("seen_count") or 1), str(item.get("created_at") or "")))
+    return items
+
+
+def card_from_item(item: dict[str, Any]) -> CardInput:
+    return CardInput(
+        word=str(item.get("word") or ""),
+        translation=str(item.get("translation") or ""),
+        usage=str(item.get("usage_tag") or ""),
+        example=str(item.get("example") or ""),
+        frequency=str(item.get("frequency") or ""),
+        level=str(item.get("level") or ""),
+    )
+
+
+def result_from_item(item: dict[str, Any], *, created: bool) -> AddCardResult:
+    return AddCardResult(
+        created=created,
+        word=str(item.get("word") or ""),
+        status=str(item.get("status") or STATUS_CREATED),
+        mochi_card_id=str(item.get("mochi_card_id") or "") or None,
+        translation=str(item.get("translation") or "") or None,
+        example=str(item.get("example") or "") or None,
+        frequency=str(item.get("frequency") or ""),
+        level=str(item.get("level") or ""),
+        seen_count=int(item.get("seen_count") or 1),
+    )
 
 
 def mark_known_word_created(*, word_key: str, mochi_card_id: str | None) -> None:
@@ -433,11 +479,20 @@ def build_mochi_content(card: CardInput) -> str:
     )
 
 
+def build_mochi_tags(card: CardInput, usage_tag: str) -> list[str]:
+    tags = ["english", "from-telegram", usage_tag]
+    if card.frequency:
+        tags.append(f"freq-{card.frequency}")
+    if card.level:
+        tags.append(card.level.lower())
+    return tags
+
+
 def create_mochi_card(card: CardInput, usage_tag: str, config: dict[str, str]) -> dict[str, Any]:
     payload = {
         "deck-id": config["MOCHI_DECK_ID"],
         "content": build_mochi_content(card),
-        "manual-tags": ["english", "from-telegram", usage_tag],
+        "manual-tags": build_mochi_tags(card, usage_tag),
         "archived?": False,
         "review-reverse?": False,
     }
@@ -473,7 +528,7 @@ def update_mochi_card(
     """False when the card no longer exists in Mochi (deleted there manually)."""
     payload = {
         "content": build_mochi_content(card),
-        "manual-tags": ["english", "from-telegram", usage_tag],
+        "manual-tags": build_mochi_tags(card, usage_tag),
     }
 
     response = requests.post(
@@ -544,7 +599,7 @@ def generate_card_with_ai(word_or_phrase: str, config: dict[str, str]) -> CardIn
             ),
         )
     except Exception as error:
-        log_event("gemini_request_error", error_type=type(error).__name__)
+        log_gemini_request_error(error)
         raise AiGenerationError("Gemini request failed") from error
 
     raw_text = (response.text or "").strip()
@@ -574,285 +629,15 @@ def generate_card_with_ai(word_or_phrase: str, config: dict[str, str]) -> CardIn
             raise AiGenerationError(f"Gemini response is missing '{field_name}'")
         fields[field_name] = value.strip()
 
-    cloze_sentence = data.get("cloze_sentence")
-    if not isinstance(cloze_sentence, str) or not cloze_sentence.strip():
-        log_event("gemini_missing_field", field="cloze_sentence")
-        raise AiGenerationError("Gemini response is missing 'cloze_sentence'")
-    fields["cloze_sentence"] = cloze_sentence.strip()
+    # Optional estimates: an unexpected value is dropped, never fails the card.
+    frequency = str(data.get("frequency") or "").strip().lower()
+    level = str(data.get("level") or "").strip().upper()
 
-    return CardInput(**fields)
-
-
-def evaluate_sentence_with_gemini(
-    word: str,
-    user_sentence: str,
-    config: dict[str, str],
-) -> dict[str, str]:
-    """
-    Ask Gemini to judge a learner's sentence for the given word.
-    Returns {"result": "good"|"minor_issue"|"wrong_usage", "feedback": ..., "better_sentence": ...}.
-    """
-    if genai is None:
-        log_event("gemini_sdk_missing")
-        raise AiGenerationError("google-genai SDK is not installed")
-
-    client = genai.Client(
-        api_key=config["GEMINI_API_KEY"],
-        http_options=genai_types.HttpOptions(timeout=GEMINI_TIMEOUT_MS),
+    return CardInput(
+        **fields,
+        frequency=frequency if frequency in FREQUENCY_VALUES else "",
+        level=level if level in CEFR_LEVELS else "",
     )
-
-    prompt = (
-        load_prompt("gemini_sentence_eval")
-        .replace("{word}", word)
-        .replace("{sentence}", user_sentence)
-    )
-
-    try:
-        response = client.models.generate_content(
-            model=config["GEMINI_MODEL"],
-            contents=prompt,
-            config=genai_types.GenerateContentConfig(
-                response_mime_type="application/json",
-            ),
-        )
-    except Exception as error:
-        log_event("gemini_request_error", error_type=type(error).__name__)
-        raise AiGenerationError("Gemini request failed") from error
-
-    raw_text = (response.text or "").strip()
-
-    try:
-        data = json.loads(raw_text)
-    except json.JSONDecodeError:
-        log_event("gemini_invalid_json", response_preview=raw_text[:120])
-        raise AiGenerationError("Gemini returned invalid JSON")
-
-    if not isinstance(data, dict) or data.get("result") not in ("good", "minor_issue", "wrong_usage"):
-        log_event("gemini_invalid_shape")
-        raise AiGenerationError("Gemini returned an invalid evaluation")
-
-    return {
-        "result": str(data["result"]),
-        "feedback": str(data.get("feedback") or "").strip(),
-        "better_sentence": str(data.get("better_sentence") or "").strip(),
-        "target_word_sentence": str(data.get("target_word_sentence") or "").strip(),
-        "natural_alternative": str(data.get("natural_alternative") or "").strip(),
-    }
-
-
-def generate_cloze_tasks_with_gemini(
-    items: list[dict[str, Any]],
-    support_items: list[dict[str, Any]],
-    config: dict[str, str],
-) -> dict[str, dict[str, Any]]:
-    """Generate fresh cloze sentences keyed by word_key."""
-    if genai is None:
-        log_event("gemini_sdk_missing")
-        raise AiGenerationError("google-genai SDK is not installed")
-
-    target_payload = [
-        {
-            "id": str(item["word_key"]),
-            "word": str(item.get("word") or ""),
-            "translation": str(item.get("translation") or ""),
-            "usage": str(item.get("usage_tag") or ""),
-        }
-        for item in items
-    ]
-    target_words = {str(item.get("word") or "").casefold() for item in items}
-    word_bank_payload = [
-        {
-            "word": str(item.get("word") or ""),
-            "translation": str(item.get("translation") or ""),
-        }
-        for item in support_items
-        if str(item.get("word") or "").casefold() not in target_words
-    ]
-
-    client = genai.Client(
-        api_key=config["GEMINI_API_KEY"],
-        http_options=genai_types.HttpOptions(timeout=GEMINI_TIMEOUT_MS),
-    )
-    prompt = (
-        load_prompt("gemini_cloze_tasks")
-        .replace("{target_items_json}", json.dumps(target_payload, ensure_ascii=False))
-        .replace("{word_bank_json}", json.dumps(word_bank_payload, ensure_ascii=False))
-    )
-
-    try:
-        response = client.models.generate_content(
-            model=config["GEMINI_MODEL"],
-            contents=prompt,
-            config=genai_types.GenerateContentConfig(
-                response_mime_type="application/json",
-            ),
-        )
-    except Exception as error:
-        log_event("gemini_request_error", error_type=type(error).__name__)
-        raise AiGenerationError("Gemini request failed") from error
-
-    raw_text = (response.text or "").strip()
-
-    try:
-        data = json.loads(raw_text)
-    except json.JSONDecodeError:
-        log_event("gemini_invalid_json", response_preview=raw_text[:120])
-        raise AiGenerationError("Gemini returned invalid JSON")
-
-    tasks = data.get("tasks") if isinstance(data, dict) else None
-    if not isinstance(tasks, list):
-        log_event("gemini_invalid_shape")
-        raise AiGenerationError("Gemini returned an invalid cloze task list")
-
-    generated: dict[str, dict[str, Any]] = {}
-    for task in tasks:
-        if not isinstance(task, dict):
-            continue
-
-        task_id = str(task.get("id") or "")
-        sentence = str(task.get("sentence") or "").strip()
-        support_words = task.get("support_words") or []
-        if not isinstance(support_words, list):
-            support_words = []
-
-        if task_id and sentence:
-            generated[task_id] = {
-                "sentence": sentence,
-                "support_words": [
-                    str(word).strip() for word in support_words if str(word).strip()
-                ],
-            }
-
-    return generated
-
-
-def generate_translation_tasks_with_gemini(
-    items: list[dict[str, Any]],
-    config: dict[str, str],
-) -> dict[str, dict[str, str]]:
-    """Generate sentence translation tasks keyed by word_key."""
-    if genai is None:
-        log_event("gemini_sdk_missing")
-        raise AiGenerationError("google-genai SDK is not installed")
-
-    payload = [
-        {
-            "id": str(item["word_key"]),
-            "word": str(item.get("word") or ""),
-            "translation": str(item.get("translation") or ""),
-            "example": str(item.get("example") or ""),
-        }
-        for item in items
-    ]
-
-    client = genai.Client(
-        api_key=config["GEMINI_API_KEY"],
-        http_options=genai_types.HttpOptions(timeout=GEMINI_TIMEOUT_MS),
-    )
-    prompt = load_prompt("gemini_translation_tasks").replace(
-        "{items_json}",
-        json.dumps(payload, ensure_ascii=False),
-    )
-
-    try:
-        response = client.models.generate_content(
-            model=config["GEMINI_MODEL"],
-            contents=prompt,
-            config=genai_types.GenerateContentConfig(
-                response_mime_type="application/json",
-            ),
-        )
-    except Exception as error:
-        log_event("gemini_request_error", error_type=type(error).__name__)
-        raise AiGenerationError("Gemini request failed") from error
-
-    raw_text = (response.text or "").strip()
-
-    try:
-        data = json.loads(raw_text)
-    except json.JSONDecodeError:
-        log_event("gemini_invalid_json", response_preview=raw_text[:120])
-        raise AiGenerationError("Gemini returned invalid JSON")
-
-    tasks = data.get("tasks") if isinstance(data, dict) else None
-    if not isinstance(tasks, list):
-        log_event("gemini_invalid_shape")
-        raise AiGenerationError("Gemini returned an invalid task list")
-
-    generated: dict[str, dict[str, str]] = {}
-    for task in tasks:
-        if not isinstance(task, dict):
-            continue
-
-        task_id = str(task.get("id") or "")
-        russian_sentence = str(task.get("russian_sentence") or "").strip()
-        expected_english = str(task.get("expected_english") or "").strip()
-        accepted_answers = task.get("accepted_answers") or []
-        if not isinstance(accepted_answers, list):
-            accepted_answers = []
-
-        if task_id and russian_sentence and expected_english:
-            generated[task_id] = {
-                "russian_sentence": russian_sentence,
-                "expected_english": expected_english,
-                "accepted_answers": [
-                    str(answer).strip() for answer in accepted_answers if str(answer).strip()
-                ],
-            }
-
-    return generated
-
-
-def evaluate_translation_with_gemini(
-    task: dict[str, Any],
-    user_answer: str,
-    config: dict[str, str],
-) -> dict[str, str]:
-    """Evaluate a sentence translation by meaning."""
-    if genai is None:
-        log_event("gemini_sdk_missing")
-        raise AiGenerationError("google-genai SDK is not installed")
-
-    client = genai.Client(
-        api_key=config["GEMINI_API_KEY"],
-        http_options=genai_types.HttpOptions(timeout=GEMINI_TIMEOUT_MS),
-    )
-    prompt = (
-        load_prompt("gemini_translation_eval")
-        .replace("{russian_sentence}", str(task.get("russian_sentence") or ""))
-        .replace("{expected_english}", str(task.get("expected_answer") or ""))
-        .replace("{word}", str(task.get("word") or ""))
-        .replace("{answer}", user_answer)
-    )
-
-    try:
-        response = client.models.generate_content(
-            model=config["GEMINI_MODEL"],
-            contents=prompt,
-            config=genai_types.GenerateContentConfig(
-                response_mime_type="application/json",
-            ),
-        )
-    except Exception as error:
-        log_event("gemini_request_error", error_type=type(error).__name__)
-        raise AiGenerationError("Gemini request failed") from error
-
-    raw_text = (response.text or "").strip()
-
-    try:
-        data = json.loads(raw_text)
-    except json.JSONDecodeError:
-        log_event("gemini_invalid_json", response_preview=raw_text[:120])
-        raise AiGenerationError("Gemini returned invalid JSON")
-
-    if not isinstance(data, dict) or data.get("result") not in ("correct", "minor_issue", "wrong"):
-        log_event("gemini_invalid_shape")
-        raise AiGenerationError("Gemini returned an invalid translation evaluation")
-
-    return {
-        "result": str(data["result"]),
-        "feedback": str(data.get("feedback") or "").strip(),
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -860,78 +645,201 @@ def evaluate_translation_with_gemini(
 # ---------------------------------------------------------------------------
 
 
-def add_card(card: CardInput, config: dict[str, str], *, source: str = "telegram") -> AddCardResult:
-    """
-    Single flow used by POST /add-card, Telegram /add, and Telegram /ai:
-    reserve in DynamoDB, create the Mochi card, then confirm or mark FAILED.
-    """
-    usage_tag = normalize_usage_tag(card.usage)
-    cloze_sentence = infer_cloze_sentence(card)
-
-    reservation = reserve_known_word(
-        word=card.word,
-        translation=card.translation,
-        example=card.example,
-        cloze_sentence=cloze_sentence,
-        usage_tag=usage_tag,
-        source=source,
-        config=config,
+def send_known_word_to_mochi(word_key: str, config: dict[str, str]) -> AddCardResult:
+    """DRAFT / INBOX / FAILED -> Mochi. A word already in Mochi is returned as is."""
+    item = set_known_word_status(
+        word_key,
+        status=STATUS_RESERVED,
+        from_statuses=(STATUS_DRAFT, STATUS_INBOX, STATUS_FAILED),
     )
 
-    if not reservation["reserved"]:
-        existing = reservation["item"]
-        return AddCardResult(
-            created=False,
-            word=existing.get("word") or card.word,
-            mochi_card_id=existing.get("mochi_card_id") or None,
-            translation=existing.get("translation") or None,
-            example=existing.get("example") or None,
-        )
+    if item is None:
+        existing = get_known_words_table().get_item(Key={"word_key": word_key}, ConsistentRead=True).get("Item")
+        if not existing:
+            raise UserInputError(WORD_NOT_FOUND_TEXT)
+        return result_from_item(existing, created=False)
 
-    word_key = reservation["item"]["word_key"]
+    card = card_from_item(item)
 
     try:
-        mochi_card = create_mochi_card(card, usage_tag, config)
+        mochi_card = create_mochi_card(card, normalize_usage_tag(card.usage), config)
     except Exception as error:
         mark_known_word_failed(word_key=word_key, error_message=str(error))
         raise
 
     mochi_card_id = mochi_card.get("id")
     mark_known_word_created(word_key=word_key, mochi_card_id=mochi_card_id)
+    log_event("word_sent_to_mochi", previous_seen_count=int(item.get("seen_count") or 1))
 
-    return AddCardResult(
-        created=True,
-        word=card.word,
-        mochi_card_id=mochi_card_id,
-        translation=card.translation,
-        example=card.example,
+    return result_from_item({**item, "status": STATUS_CREATED, "mochi_card_id": mochi_card_id}, created=True)
+
+
+def move_known_word_to_inbox(word_key: str) -> AddCardResult:
+    item = set_known_word_status(word_key, status=STATUS_INBOX, from_statuses=(STATUS_DRAFT, STATUS_FAILED))
+
+    if item is None:
+        existing = get_known_words_table().get_item(Key={"word_key": word_key}, ConsistentRead=True).get("Item")
+        if not existing:
+            raise UserInputError(WORD_NOT_FOUND_TEXT)
+        return result_from_item(existing, created=False)
+
+    return result_from_item(item, created=True)
+
+
+def handle_existing_word(
+    item: dict[str, Any],
+    destination: str | None,
+    config: dict[str, str],
+) -> AddCardResult:
+    """Draft/inbox words count one more sighting and then go where asked."""
+    if item.get("status") not in (STATUS_DRAFT, STATUS_INBOX):
+        return result_from_item(item, created=False)
+
+    item = record_sighting(item["word_key"])
+
+    if destination == DESTINATION_MOCHI:
+        return send_known_word_to_mochi(item["word_key"], config)
+
+    if destination == DESTINATION_INBOX:
+        return move_known_word_to_inbox(item["word_key"])
+
+    return result_from_item(item, created=False)
+
+
+def store_new_card(
+    card: CardInput,
+    config: dict[str, str],
+    *,
+    destination: str | None,
+    source: str,
+) -> AddCardResult:
+    item = put_new_known_word(
+        card=card,
+        usage_tag=normalize_usage_tag(card.usage),
+        status=STATUS_INBOX if destination == DESTINATION_INBOX else STATUS_DRAFT,
+        source=source,
+        config=config,
     )
 
+    if item is None:  # the same word was added concurrently
+        existing = get_known_word(card.word, config)
+        if not existing:
+            raise UserInputError(WORD_NOT_FOUND_TEXT)
+        return handle_existing_word(existing, destination, config)
 
-def add_ai_card(word_or_phrase: str, config: dict[str, str]) -> AddCardResult:
-    """
-    AI flow: check DynamoDB first so duplicates never spend a Gemini call,
-    then generate the card and push it through the central add_card() flow.
-    """
-    existing = get_known_word(word_or_phrase, config)
+    if destination == DESTINATION_MOCHI:
+        return send_known_word_to_mochi(item["word_key"], config)
 
-    if existing and existing.get("status") in (STATUS_CREATED, STATUS_RESERVED):
-        return AddCardResult(
-            created=False,
-            word=existing.get("word") or word_or_phrase,
-            mochi_card_id=existing.get("mochi_card_id") or None,
-            translation=existing.get("translation") or None,
-            example=existing.get("example") or None,
+    return result_from_item(item, created=True)
+
+
+def add_card(
+    card: CardInput,
+    config: dict[str, str],
+    *,
+    destination: str | None,
+    source: str = "telegram",
+) -> AddCardResult:
+    """
+    Single flow used by POST /add-card and Telegram /add: an existing word is
+    reused (and counted), a new one is stored as a draft, in inbox, or sent to Mochi.
+    """
+    existing = get_known_word(card.word, config)
+
+    if existing and existing.get("status") != STATUS_FAILED:
+        return handle_existing_word(existing, destination, config)
+
+    return store_new_card(card, config, destination=destination, source=source)
+
+
+def split_bulk_words(text: str) -> list[str]:
+    """One word/phrase per line or ";"-separated; list markers stripped, duplicates dropped."""
+    words: list[str] = []
+    seen: set[str] = set()
+
+    for chunk in re.split(BULK_AI_SEPARATORS_PATTERN, text):
+        word = re.sub(BULK_AI_LIST_MARKER_PATTERN, "", chunk).strip()
+        lookup = normalize_word_for_lookup(word)
+        if lookup and lookup not in seen:
+            seen.add(lookup)
+            words.append(word)
+
+    return words
+
+
+def generate_card_or_none(word_or_phrase: str, config: dict[str, str]) -> CardInput | None:
+    try:
+        return generate_card_with_ai(word_or_phrase, config)
+    except AiGenerationError:
+        return None
+
+
+def result_or_none(action: Callable[[], AddCardResult]) -> AddCardResult | None:
+    """One failed word must not stop the rest of a list."""
+    try:
+        return action()
+    except Exception as error:
+        log_event("add_word_error", error_type=type(error).__name__)
+        return None
+
+
+def add_ai_cards(
+    words: list[str],
+    config: dict[str, str],
+    *,
+    destination: str | None,
+) -> list[tuple[str, AddCardResult | None]]:
+    """
+    /ai, /mochi and /inbox for one or many words. Existing words never spend a
+    Gemini call; Gemini runs in parallel, DynamoDB and Mochi writes stay
+    sequential. None means the word failed.
+    """
+    results: dict[str, AddCardResult | None] = {}
+    to_generate: list[str] = []
+
+    for word in words:
+        existing = get_known_word(word, config)
+        if existing and existing.get("status") != STATUS_FAILED:
+            results[word] = result_or_none(lambda: handle_existing_word(existing, destination, config))
+        else:
+            to_generate.append(word)
+
+    if to_generate:
+        with ThreadPoolExecutor(max_workers=min(BULK_AI_MAX_WORKERS, len(to_generate))) as pool:
+            cards = list(pool.map(lambda word: generate_card_or_none(word, config), to_generate))
+
+        for word, card in zip(to_generate, cards):
+            if card is None:
+                results[word] = None
+                continue
+            results[word] = result_or_none(
+                lambda: store_new_card(card, config, destination=destination, source="telegram")
+            )
+
+    return [(word, results[word]) for word in words]
+
+
+def promote_seen_inbox_words(config: dict[str, str]) -> list[tuple[str, AddCardResult | None]]:
+    """Inbox words seen INBOX_PROMOTE_MIN_SEEN+ times -> Mochi, a batch per call."""
+    candidates = [
+        item
+        for item in scan_inbox_items(config)
+        if int(item.get("seen_count") or 1) >= INBOX_PROMOTE_MIN_SEEN
+    ][:INBOX_PROMOTE_BATCH]
+
+    return [
+        (
+            str(item.get("word") or ""),
+            result_or_none(lambda: send_known_word_to_mochi(item["word_key"], config)),
         )
-
-    card = generate_card_with_ai(word_or_phrase, config)
-    return add_card(card, config, source="telegram")
+        for item in candidates
+    ]
 
 
 def regenerate_card(normalized_word: str, config: dict[str, str]) -> AddCardResult:
     """
-    Regenerate translation/example with Gemini for an already saved word,
-    updating both the Mochi card (when it exists) and the DynamoDB item.
+    Regenerate translation/example with Gemini for an already saved word.
+    Words in Mochi are synced there too; drafts and inbox words stay local.
     """
     table = get_known_words_table()
     word_key = build_word_key(
@@ -943,53 +851,39 @@ def regenerate_card(normalized_word: str, config: dict[str, str]) -> AddCardResu
     if not item:
         raise UserInputError(WORD_NOT_FOUND_TEXT)
 
-    word = str(item.get("word") or normalized_word)
-    card = generate_card_with_ai(word, config)
+    card = generate_card_with_ai(str(item.get("word") or normalized_word), config)
     usage_tag = normalize_usage_tag(card.usage)
-    cloze_sentence = infer_cloze_sentence(card)
 
-    # DynamoDB keeps Telegram's local index; Mochi remains the card system.
-    # If the linked Mochi card is gone, create a new one and relink it.
     mochi_card_id = str(item.get("mochi_card_id") or "")
-    if not mochi_card_id or not update_mochi_card(mochi_card_id, card, usage_tag, config):
-        mochi_card_id = str(create_mochi_card(card, usage_tag, config).get("id") or "")
+    if item.get("status") == STATUS_CREATED:
+        mochi_card_id = sync_mochi_card_for_known_word(item, card, usage_tag, config)
 
     update_expression = (
         "SET #translation = :translation, example = :example, "
-        "usage_tag = :usage_tag, mochi_card_id = :mochi_card_id, "
-        "#status = :status, updated_at = :updated_at"
+        "usage_tag = :usage_tag, frequency = :frequency, #level = :level, "
+        "mochi_card_id = :mochi_card_id, updated_at = :updated_at"
     )
-    expression_values = {
-        ":translation": card.translation,
-        ":example": card.example,
-        ":usage_tag": usage_tag,
-        ":mochi_card_id": mochi_card_id,
-        ":status": STATUS_CREATED,
-        ":updated_at": utc_now_iso(),
-    }
-    if cloze_sentence:
-        update_expression += ", cloze_sentence = :cloze_sentence"
-        expression_values[":cloze_sentence"] = cloze_sentence
-
     update_expression += remove_expression_for(LEGACY_CARD_SRS_ATTRIBUTES)
 
-    table.update_item(
+    updated = table.update_item(
         Key={"word_key": word_key},
-        # "translation" and "status" are DynamoDB reserved keywords.
+        # "translation" and "level" are DynamoDB reserved keywords.
         UpdateExpression=update_expression,
-        ExpressionAttributeNames={"#translation": "translation", "#status": "status"},
-        ExpressionAttributeValues=expression_values,
-    )
+        ExpressionAttributeNames={"#translation": "translation", "#level": "level"},
+        ExpressionAttributeValues={
+            ":translation": card.translation,
+            ":example": card.example,
+            ":usage_tag": usage_tag,
+            ":frequency": card.frequency,
+            ":level": card.level,
+            ":mochi_card_id": mochi_card_id,
+            ":updated_at": utc_now_iso(),
+        },
+        ReturnValues="ALL_NEW",
+    )["Attributes"]
 
     log_event("card_regenerated", has_mochi_card=bool(mochi_card_id))
-
-    return AddCardResult(
-        created=True,
-        word=word,
-        mochi_card_id=mochi_card_id or None,
-        translation=card.translation,
-        example=card.example,
-    )
+    return result_from_item(updated, created=False)
 
 
 def sync_mochi_card_for_known_word(
@@ -1029,16 +923,9 @@ def build_known_word_item_from_card(
         "example": card.example,
         "usage_tag": usage_tag,
         "mochi_card_id": mochi_card_id,
-        "status": STATUS_CREATED,
         "updated_at": now,
     }
     item.setdefault("created_at", now)
-
-    cloze_sentence = infer_cloze_sentence(card)
-    if cloze_sentence:
-        item["cloze_sentence"] = cloze_sentence
-    else:
-        item.pop("cloze_sentence", None)
 
     for old_srs_attr in LEGACY_CARD_SRS_ATTRIBUTES:
         item.pop(old_srs_attr, None)
@@ -1058,6 +945,12 @@ def update_known_word_from_edit(
     if not existing_item:
         raise UserInputError(WORD_NOT_FOUND_TEXT)
 
+    # The edit format has no frequency/level; keep the stored estimates.
+    card = replace(
+        card,
+        frequency=str(existing_item.get("frequency") or ""),
+        level=str(existing_item.get("level") or ""),
+    )
     usage_tag = normalize_usage_tag(card.usage)
     new_word_key = word_key_for(card.word, config)
 
@@ -1066,7 +959,10 @@ def update_known_word_from_edit(
         if collision:
             raise UserInputError("A card with this word already exists.")
 
-    mochi_card_id = sync_mochi_card_for_known_word(existing_item, card, usage_tag, config)
+    mochi_card_id = str(existing_item.get("mochi_card_id") or "")
+    if existing_item.get("status") == STATUS_CREATED:
+        mochi_card_id = sync_mochi_card_for_known_word(existing_item, card, usage_tag, config)
+
     item = build_known_word_item_from_card(
         existing_item=existing_item,
         card=card,
@@ -1098,17 +994,7 @@ def update_known_word_from_edit(
             "mochi_card_id = :mochi_card_id, #status = :status, updated_at = :updated_at"
         )
 
-        if "cloze_sentence" in item:
-            update_expression += ", cloze_sentence = :cloze_sentence"
-            expression_values[":cloze_sentence"] = item["cloze_sentence"]
-            remove_attrs = LEGACY_CARD_SRS_ATTRIBUTES
-        else:
-            remove_attrs = (  # also remove an invalid cloze sentence when the edit cannot support it
-                "cloze_sentence",
-                *LEGACY_CARD_SRS_ATTRIBUTES,
-            )
-
-        update_expression += remove_expression_for(remove_attrs)
+        update_expression += remove_expression_for(LEGACY_CARD_SRS_ATTRIBUTES)
 
         table.update_item(
             Key={"word_key": old_word_key},
@@ -1122,14 +1008,7 @@ def update_known_word_from_edit(
         )
 
     log_event("card_edited", word_changed=new_word_key != old_word_key, has_mochi_card=bool(mochi_card_id))
-
-    return AddCardResult(
-        created=True,
-        word=card.word,
-        mochi_card_id=mochi_card_id or None,
-        translation=card.translation,
-        example=card.example,
-    )
+    return result_from_item(item, created=False)
 
 
 def delete_known_word(normalized_word: str, config: dict[str, str]) -> str:
@@ -1185,6 +1064,11 @@ def send_telegram_message(
         )
 
 
+def send_telegram_replies(*, chat_id: int | str, replies: list[Reply], config: dict[str, str]) -> None:
+    for text, reply_markup in replies:
+        send_telegram_message(chat_id=chat_id, text=text, config=config, reply_markup=reply_markup)
+
+
 def answer_callback_query(callback_query_id: str, config: dict[str, str]) -> None:
     response = requests.post(
         f"{TELEGRAM_API_BASE}/bot{config['TELEGRAM_BOT_TOKEN']}/answerCallbackQuery",
@@ -1231,23 +1115,36 @@ def callback_data_for(prefix: str, word: str) -> str | None:
     return data
 
 
-def build_card_actions_keyboard(word: str) -> dict[str, Any] | None:
+def build_card_actions_keyboard(word: str, status: str) -> dict[str, Any] | None:
+    """Drafts get To Mochi + Inbox, inbox words get To Mochi; everyone gets Regenerate/Edit/Delete."""
+    to_mochi = callback_data_for(CALLBACK_TO_MOCHI_PREFIX, word)
+    to_inbox = callback_data_for(CALLBACK_TO_INBOX_PREFIX, word)
     regen = callback_data_for(CALLBACK_REGEN_PREFIX, word)
     edit = callback_data_for(CALLBACK_EDIT_PREFIX, word)
     delete = callback_data_for(CALLBACK_DELETE_PREFIX, word)
 
-    if not regen or not edit or not delete:
+    if not all((to_mochi, to_inbox, regen, edit, delete)):
         return None
 
-    return {
-        "inline_keyboard": [
+    rows = []
+    if status in (STATUS_DRAFT, STATUS_FAILED):
+        rows.append(
             [
-                {"text": REGENERATE_BUTTON_TEXT, "callback_data": regen},
-                {"text": EDIT_BUTTON_TEXT, "callback_data": edit},
-                {"text": DELETE_BUTTON_TEXT, "callback_data": delete},
+                {"text": TO_MOCHI_BUTTON_TEXT, "callback_data": to_mochi},
+                {"text": TO_INBOX_BUTTON_TEXT, "callback_data": to_inbox},
             ]
+        )
+    elif status == STATUS_INBOX:
+        rows.append([{"text": TO_MOCHI_BUTTON_TEXT, "callback_data": to_mochi}])
+
+    rows.append(
+        [
+            {"text": REGENERATE_BUTTON_TEXT, "callback_data": regen},
+            {"text": EDIT_BUTTON_TEXT, "callback_data": edit},
+            {"text": DELETE_BUTTON_TEXT, "callback_data": delete},
         ]
-    }
+    )
+    return {"inline_keyboard": rows}
 
 
 def build_delete_confirmation(normalized_word: str, config: dict[str, str]) -> tuple[str, dict[str, Any] | None]:
@@ -1274,23 +1171,27 @@ def build_delete_confirmation(normalized_word: str, config: dict[str, str]) -> t
             ]
         ]
     }
-    return f"Delete <b>{html.escape(word)}</b>? It will also be removed from Mochi.", keyboard
+    question = f"Delete <b>{html.escape(word)}</b>?"
+    if item.get("mochi_card_id"):
+        question += " It will also be removed from Mochi."
+    return question, keyboard
 
 
 def parse_telegram_command(text: str) -> TelegramCommand:
     """
     Supported:
       /add word | translation | usage | example  -> mode="manual"
-      /ai word_or_phrase                         -> mode="ai"
+      /ai | /mochi | /inbox word_or_phrase       -> mode="ai" (draft | Mochi | inbox)
+        one word per line or ";"-separated for several words
+      /inbox                                     -> mode="inbox_list"
       /delete word                               -> mode="delete"
       /help, /start                              -> mode="help"
-      /today                                     -> mode="practice_today"
-      /stats                                     -> mode="stats"
       /cancel                                    -> mode="cancel"
     Anything else raises UserInputError with the format help.
     """
     text = text.strip()
-    command, _, rest = text.partition(" ")
+    # Split on any whitespace so "/ai\nword1\nword2" keeps the newlines in rest.
+    command, rest = (text.split(maxsplit=1) + [""])[:2]
     command = command.split("@", 1)[0].lower()  # supports /add@YourBotName
     rest = rest.strip()
 
@@ -1299,12 +1200,6 @@ def parse_telegram_command(text: str) -> TelegramCommand:
 
     if command == "/cancel":
         return TelegramCommand(mode="cancel")
-
-    if command == "/today":
-        return TelegramCommand(mode="practice_today")
-
-    if command == "/stats":
-        return TelegramCommand(mode="stats")
 
     if command == "/add":
         parts = [part.strip() for part in rest.split("|")]
@@ -1317,10 +1212,16 @@ def parse_telegram_command(text: str) -> TelegramCommand:
             card=CardInput(word=word, translation=translation, usage=usage, example=example),
         )
 
-    if command == "/ai":
-        if not rest:
+    if command == "/inbox" and not rest:
+        return TelegramCommand(mode="inbox_list")
+
+    if command in AI_COMMAND_DESTINATIONS:
+        words = split_bulk_words(rest)
+        if not words:
             raise UserInputError(f"Please add a word or phrase:\n\n{HELP_TEXT}")
-        return TelegramCommand(mode="ai", query=rest)
+        if len(words) > BULK_AI_MAX_WORDS:
+            raise UserInputError(BULK_AI_TOO_MANY_TEXT.format(limit=BULK_AI_MAX_WORDS, count=len(words)))
+        return TelegramCommand(mode="ai", queries=tuple(words), destination=AI_COMMAND_DESTINATIONS[command])
 
     if command == "/delete":
         if not rest:
@@ -1338,22 +1239,110 @@ def extract_telegram_message(update: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
-def build_add_result_reply(
-    result: AddCardResult,
-    *,
-    title: str | None = None,
-) -> tuple[str, dict[str, Any] | None]:
-    """Card summary with what goes to Mochi, plus a Regenerate button."""
-    word = html.escape(result.word)
-    status = title or ("✅ Added" if result.created else "🔁 Exists")
+def format_word_meta(*, frequency: str, level: str, seen_count: int) -> str:
+    """E.g. "common · B2 · seen 3×"; empty when there is nothing to show."""
+    parts = [part for part in (frequency, level) if part]
+    if seen_count > 1:
+        parts.append(f"seen {seen_count}×")
+    return " · ".join(parts)
 
-    lines = [f"{status}: <b>{word}</b>"]
+
+def build_add_result_reply(result: AddCardResult, *, title: str | None = None) -> Reply:
+    """Card summary plus buttons that depend on where the word is now."""
+    status_title = WORD_STATUS_TITLES.get(result.status, result.status)
+    if result.status == STATUS_CREATED and not result.created:
+        status_title = ALREADY_IN_MOCHI_TITLE
+
+    header = f"{title} ({status_title})" if title else status_title
+    lines = [f"{header}: <b>{html.escape(result.word)}</b>"]
     if result.translation:
         lines += ["", f"<b>{html.escape(result.translation)}</b>"]
     if result.example:
         lines.append(f"<i>{html.escape(result.example)}</i>")
 
-    return "\n".join(lines), build_card_actions_keyboard(result.word)
+    meta = format_word_meta(frequency=result.frequency, level=result.level, seen_count=result.seen_count)
+    if meta:
+        lines += ["", f"📊 {html.escape(meta)}"]
+
+    if result.status == STATUS_DRAFT:
+        lines.append(DRAFT_HINT_TEXT)
+    if result.status in (STATUS_DRAFT, STATUS_INBOX) and result.seen_count >= INBOX_SUGGEST_SEEN_COUNT:
+        lines.append(INBOX_SUGGEST_TEXT)
+
+    return "\n".join(lines), build_card_actions_keyboard(result.word, result.status)
+
+
+def build_word_replies(results: list[tuple[str, AddCardResult | None]]) -> list[Reply]:
+    """One message per word, so every card keeps its own buttons."""
+    return [
+        build_add_result_reply(result) if result else (f"{BULK_AI_FAILED_LABEL}: <b>{html.escape(word)}</b>", None)
+        for word, result in results
+    ]
+
+
+def build_inbox_reply(config: dict[str, str]) -> Reply:
+    items = scan_inbox_items(config)
+    if not items:
+        return INBOX_EMPTY_TEXT, None
+
+    shown = items[:INBOX_LIST_LIMIT]
+    lines = [f"📥 Inbox: {len(items)}", ""]
+    rows = []
+
+    for index, item in enumerate(shown, start=1):
+        word = str(item.get("word") or "")
+        meta = format_word_meta(
+            frequency=str(item.get("frequency") or ""),
+            level=str(item.get("level") or ""),
+            seen_count=int(item.get("seen_count") or 1),
+        )
+        line = f"{index}. <b>{html.escape(word)}</b> — {html.escape(str(item.get('translation') or ''))}"
+        if meta:
+            line += f" <i>({html.escape(meta)})</i>"
+        lines.append(line)
+
+        to_mochi = callback_data_for(CALLBACK_TO_MOCHI_PREFIX, word)
+        delete = callback_data_for(CALLBACK_DELETE_PREFIX, word)
+        if to_mochi and delete:
+            rows.append(
+                [
+                    {"text": f"{TO_MOCHI_BUTTON_TEXT}: {word}", "callback_data": to_mochi},
+                    {"text": INBOX_DELETE_BUTTON_TEXT, "callback_data": delete},
+                ]
+            )
+
+    if len(items) > len(shown):
+        lines.append(f"… and {len(items) - len(shown)} more")
+
+    if any(int(item.get("seen_count") or 1) >= INBOX_PROMOTE_MIN_SEEN for item in items):
+        rows.append(
+            [
+                {
+                    "text": INBOX_PROMOTE_BUTTON_TEXT.format(min_seen=INBOX_PROMOTE_MIN_SEEN),
+                    "callback_data": CALLBACK_INBOX_PROMOTE,
+                }
+            ]
+        )
+
+    return "\n".join(lines), {"inline_keyboard": rows} if rows else None
+
+
+def build_inbox_promote_replies(config: dict[str, str]) -> list[Reply]:
+    results = promote_seen_inbox_words(config)
+    if not results:
+        return [(INBOX_NOTHING_TO_PROMOTE_TEXT.format(min_seen=INBOX_PROMOTE_MIN_SEEN), None)]
+
+    moved = [html.escape(word) for word, result in results if result and result.status == STATUS_CREATED]
+    failed = [html.escape(word) for word, result in results if not result or result.status != STATUS_CREATED]
+
+    lines = []
+    if moved:
+        lines.append(f"✅ Sent to Mochi: {', '.join(moved)}")
+    if failed:
+        lines.append(f"{BULK_AI_FAILED_LABEL}: {', '.join(failed)}")
+
+    # Fresh list so leftovers (or the next batch) can be handled right away.
+    return [("\n".join(lines), None), build_inbox_reply(config)]
 
 
 def process_telegram_text(
@@ -1361,359 +1350,39 @@ def process_telegram_text(
     config: dict[str, str],
     *,
     telegram_user_id: str,
-) -> tuple[str, dict[str, Any] | None]:
-    """Returns (reply_text, reply_markup or None)."""
+) -> list[Reply]:
+    """Returns the messages to send back, usually one."""
     stripped = text.strip()
 
     session = get_active_session(telegram_user_id)
     if session and stripped.lower() == "/cancel":
         clear_session(telegram_user_id)
-        return CANCELLED_TEXT, None
+        return [(CANCELLED_TEXT, None)]
 
-    # Plain text while a session is active is either a practice answer or edit payload.
+    # Plain text while an edit session is active is the edited card.
     if session and not stripped.startswith("/"):
-        if session.get("session_type") == PRACTICE_SESSION_TYPE_EDIT:
-            return handle_edit_card_answer(session, stripped, config)
-        return handle_practice_answer(session, stripped, config)
+        return [handle_edit_card_answer(session, stripped, config)]
 
     command = parse_telegram_command(stripped)
     log_event("telegram_command", mode=command.mode)
 
     if command.mode == "cancel":
         clear_session(telegram_user_id)
-        return CANCELLED_TEXT, None
+        return [(CANCELLED_TEXT, None)]
 
     if command.mode == "help":
-        return HELP_TEXT, build_help_menu()
-
-    if command.mode == "practice_today":
-        return start_today_practice_session(telegram_user_id, config)
-
-    if command.mode == "stats":
-        return build_stats_reply(), None
+        return [(HELP_TEXT, build_help_menu())]
 
     if command.mode == "delete":
-        return build_delete_confirmation(normalize_word_for_lookup(command.query), config)
+        return [build_delete_confirmation(normalize_word_for_lookup(command.query), config)]
+
+    if command.mode == "inbox_list":
+        return [build_inbox_reply(config)]
 
     if command.mode == "manual":
-        return build_add_result_reply(add_card(command.card, config, source="telegram"))
+        return [build_add_result_reply(add_card(command.card, config, destination=None, source="telegram"))]
 
-    return build_add_result_reply(add_ai_card(command.query, config))
-
-
-# ---------------------------------------------------------------------------
-# Active practice: word selection
-# ---------------------------------------------------------------------------
-
-
-def scan_known_word_items(limit: int = PRACTICE_SCAN_LIMIT) -> list[dict[str, Any]]:
-    """Scan is fine here: small personal table (see project constraints)."""
-    table = get_known_words_table()
-    items: list[dict[str, Any]] = []
-    last_evaluated_key = None
-
-    while True:
-        scan_kwargs: dict[str, Any] = {}
-
-        if limit:
-            remaining = limit - len(items)
-            if remaining <= 0:
-                log_event("practice_scan_capped", limit=limit)
-                break
-            scan_kwargs["Limit"] = remaining
-
-        if last_evaluated_key:
-            scan_kwargs["ExclusiveStartKey"] = last_evaluated_key
-
-        response = table.scan(**scan_kwargs)
-        items.extend(response.get("Items") or [])
-        last_evaluated_key = response.get("LastEvaluatedKey")
-
-        if not last_evaluated_key:
-            break
-
-    return items
-
-
-def get_known_words_for_practice(limit: int = PRACTICE_SCAN_LIMIT) -> list[dict[str, Any]]:
-    return [item for item in scan_known_word_items(limit=limit) if item.get("status") == STATUS_CREATED]
-
-
-def build_cloze_sentence(
-    word: str,
-    example: str,
-    cloze_sentence: str | None = None,
-) -> str | None:
-    """Blank the target word out of its cloze sentence or example."""
-    if not word:
-        return None
-
-    pattern = rf"(?<!\w){re.escape(word)}(?!\w)"
-
-    for sentence in (cloze_sentence, example):
-        if not sentence:
-            continue
-
-        blanked, count = re.subn(pattern, CLOZE_BLANK, sentence, flags=re.IGNORECASE)
-        if count:
-            return blanked
-
-    return None
-
-
-def word_fits_active_practice(item: dict[str, Any]) -> bool:
-    word = str(item.get("word") or "")
-    return bool(word and item.get("translation"))
-
-
-def word_fits_blank_practice(item: dict[str, Any]) -> bool:
-    return word_fits_active_practice(item)
-
-
-def parse_iso_datetime(value: Any) -> datetime | None:
-    if not value:
-        return None
-
-    try:
-        parsed = datetime.fromisoformat(str(value))
-    except ValueError:
-        return None
-
-    if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=timezone.utc)
-
-    return parsed
-
-
-def practice_candidate_score(item: dict[str, Any], now: datetime) -> float:
-    correct_count = int(item.get("correct_count") or 0)
-    wrong_count = int(item.get("wrong_count") or 0)
-    minor_issue_count = int(item.get("minor_issue_count") or 0)
-    idk_count = int(item.get("idk_count") or 0)
-    practice_score = int(item.get("practice_score") or 0)
-    last_practiced_at = parse_iso_datetime(item.get("last_practiced_at"))
-    next_practice_at = parse_iso_datetime(item.get("next_practice_at"))
-
-    score = random.random()
-    score += wrong_count * 3
-    score += idk_count * 3
-    score += minor_issue_count * 2
-    score += practice_score * 2
-    score -= correct_count * 0.4
-
-    if not last_practiced_at:
-        score += 5
-    else:
-        hours_since_practice = max((now - last_practiced_at).total_seconds() / 3600, 0)
-        if hours_since_practice < 24:
-            score -= 5
-        else:
-            score += min(hours_since_practice / 24, 7) * 0.5
-
-    if not next_practice_at:
-        score += 4
-    elif next_practice_at <= now:
-        days_ready = max((now - next_practice_at).total_seconds() / 86400, 0)
-        score += 4 + min(days_ready, 7)
-    else:
-        hours_until_ready = max((next_practice_at - now).total_seconds() / 3600, 0)
-        score -= min(hours_until_ready / 24, 5)
-
-    return score
-
-
-def choose_practice_block(
-    candidates: list[dict[str, Any]],
-    limit: int,
-    *,
-    excluded_word_keys: set[str] | None = None,
-) -> list[dict[str, Any]]:
-    excluded_word_keys = excluded_word_keys or set()
-    now = datetime.now(timezone.utc)
-    available = [
-        item for item in candidates if str(item.get("word_key") or "") not in excluded_word_keys
-    ]
-    ranked = sorted(
-        available,
-        key=lambda item: practice_candidate_score(item, now),
-        reverse=True,
-    )
-    return ranked[:limit]
-
-
-def build_today_practice_questions(
-    words: list[dict[str, Any]],
-    support_words: list[dict[str, Any]],
-    config: dict[str, str],
-) -> list[dict[str, Any]]:
-    generated_tasks = generate_cloze_tasks_with_gemini(words, support_words, config)
-    questions = []
-
-    for item in words:
-        word_key = str(item["word_key"])
-        word = str(item.get("word") or "")
-        translation = str(item.get("translation") or "")
-        generated = generated_tasks.get(word_key)
-        if not generated:
-            raise AiGenerationError("Gemini did not generate all cloze tasks")
-
-        generated_sentence = str(generated.get("sentence") or "")
-        blanked = build_cloze_sentence(word, generated_sentence)
-        if not blanked:
-            raise AiGenerationError("Gemini generated a cloze sentence without the target word")
-
-        questions.append(
-            {
-                "task_type": TASK_TYPE_FILL_BLANK,
-                "linked_word_keys": [word_key],
-                "target_word_keys": [word_key],
-                "word": word,
-                "translation": translation,
-                "prompt": f"{blanked} ({translation})",
-                "source_sentence": generated_sentence,
-                "support_words": generated.get("support_words") or [],
-                "expected_answer": word,
-                "accepted_answers": [word],
-                "acceptable_answers": [word],
-            }
-        )
-
-    return questions
-
-
-def build_translation_practice_questions(
-    words: list[dict[str, Any]],
-    config: dict[str, str],
-) -> list[dict[str, Any]]:
-    generated_tasks = generate_translation_tasks_with_gemini(words, config)
-    questions = []
-    for item in words:
-        word_key = str(item["word_key"])
-        word = str(item.get("word") or "")
-        generated = generated_tasks.get(word_key)
-        if not generated:
-            raise AiGenerationError("Gemini did not generate all translation tasks")
-
-        russian_sentence = generated["russian_sentence"]
-        expected_english = generated["expected_english"]
-        accepted_answers = [
-            expected_english,
-            *generated.get("accepted_answers", []),
-            *sorted(get_normalized_variants(expected_english)),
-        ]
-
-        questions.append(
-            {
-                "task_type": TASK_TYPE_TRANSLATE_RU_EN,
-                "linked_word_keys": [word_key],
-                "target_word_keys": [word_key],
-                "word": word,
-                "translation": str(item.get("translation") or ""),
-                "russian_sentence": russian_sentence,
-                "prompt": f"Переведи на английский:\n{russian_sentence}",
-                "expected_answer": expected_english,
-                "accepted_answers": list(dict.fromkeys(accepted_answers)),
-                "acceptable_answers": [expected_english],
-            }
-        )
-
-    return questions
-
-
-def build_own_sentence_practice_questions(words: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [
-        {
-            "task_type": TASK_TYPE_OWN_SENTENCE,
-            "linked_word_keys": [item["word_key"]],
-            "target_word_keys": [item["word_key"]],
-            "word": str(item.get("word") or ""),
-            "translation": str(item.get("translation") or ""),
-            "example": str(item.get("example") or ""),
-            "prompt": f"Напиши свое предложение со словом/фразой: {item.get('word')}",
-            "expected_answer": str(item.get("word") or ""),
-            "accepted_answers": [str(item.get("word") or "")],
-            "acceptable_answers": [str(item.get("word") or "")],
-        }
-        for item in words
-    ]
-
-
-def build_today_practice_tasks(config: dict[str, str]) -> list[dict[str, Any]]:
-    words = [item for item in get_known_words_for_practice() if word_fits_active_practice(item)]
-    blank_candidates = [item for item in words if word_fits_blank_practice(item)]
-    used_word_keys: set[str] = set()
-
-    blank_words = choose_practice_block(
-        blank_candidates,
-        PRACTICE_BLOCK_QUESTION_COUNT,
-        excluded_word_keys=used_word_keys,
-    )
-    used_word_keys.update(str(item["word_key"]) for item in blank_words)
-
-    translation_words = choose_practice_block(
-        words,
-        PRACTICE_BLOCK_QUESTION_COUNT,
-        excluded_word_keys=used_word_keys,
-    )
-    used_word_keys.update(str(item["word_key"]) for item in translation_words)
-
-    own_sentence_words = choose_practice_block(
-        words,
-        PRACTICE_BLOCK_QUESTION_COUNT,
-        excluded_word_keys=used_word_keys,
-    )
-
-    if (
-        len(blank_words) < PRACTICE_BLOCK_QUESTION_COUNT
-        or len(translation_words) < PRACTICE_BLOCK_QUESTION_COUNT
-        or len(own_sentence_words) < PRACTICE_BLOCK_QUESTION_COUNT
-    ):
-        return []
-
-    tasks = []
-    support_words = [*translation_words, *own_sentence_words, *blank_words]
-    tasks.extend(build_today_practice_questions(blank_words, support_words, config))
-    tasks.extend(build_translation_practice_questions(translation_words, config))
-    tasks.extend(build_own_sentence_practice_questions(own_sentence_words))
-    return tasks
-
-
-def start_today_practice_session(
-    telegram_user_id: str,
-    config: dict[str, str],
-) -> tuple[str, dict[str, Any] | None]:
-    tasks = build_today_practice_tasks(config)
-
-    if len(tasks) < PRACTICE_QUESTION_COUNT:
-        return NOT_ENOUGH_WORDS_TEXT, None
-
-    session = {
-        "telegram_user_id": str(telegram_user_id),
-        "user_id": str(telegram_user_id),
-        "training_id": f"{telegram_user_id}:{int(time.time())}",
-        "session_type": PRACTICE_SESSION_TYPE_ACTIVE,
-        "storage_version": COMPACT_STORAGE_VERSION,
-        "mode": PRACTICE_MODE_TODAY,
-        "tasks": tasks,
-        "current_task_index": 0,
-        "user_answers": [],
-        "evaluation_results": [],
-        "created_at": utc_now_iso(),
-        "expires_at": int(time.time()) + PRACTICE_SESSION_TTL_SECONDS,
-        "status": SESSION_STATUS_ACTIVE,
-    }
-    save_session(str(telegram_user_id), session)
-
-    log_event("active_practice_started", mode=PRACTICE_MODE_TODAY, tasks=len(tasks))
-    return (
-        "\n\n".join(
-            [
-                TODAY_PRACTICE_INTRO,
-                build_task_prompt(tasks[0], 1, len(tasks)),
-            ]
-        ),
-        build_practice_task_keyboard(),
-    )
+    return build_word_replies(add_ai_cards(list(command.queries), config, destination=command.destination))
 
 
 # ---------------------------------------------------------------------------
@@ -1721,35 +1390,24 @@ def start_today_practice_session(
 # ---------------------------------------------------------------------------
 
 
-def get_practice_sessions_table():
+def get_sessions_table():
+    # The table is still named "practice-sessions" in infra; it now only holds edit sessions.
     return boto3.resource("dynamodb").Table(get_practice_sessions_table_name())
 
 
-def save_session(telegram_user_id: str, session: dict[str, Any]) -> None:
-    if (
-        session.get("session_type") == PRACTICE_SESSION_TYPE_ACTIVE
-        and session.get("storage_version") == COMPACT_STORAGE_VERSION
-        and session.get("tasks")
-    ):
-        save_practice_session(
-            get_practice_sessions_table(),
-            user_id=str(telegram_user_id),
-            session=session,
-            tasks=list(session.get("tasks") or []),
-        )
-        return
-
-    get_practice_sessions_table().put_item(Item=session)
+def save_session(session: dict[str, Any]) -> None:
+    get_sessions_table().put_item(Item=session)
 
 
 def get_active_session(telegram_user_id: str) -> dict[str, Any] | None:
     item = (
-        get_practice_sessions_table()
+        get_sessions_table()
         .get_item(Key={"telegram_user_id": str(telegram_user_id)}, ConsistentRead=True)
         .get("Item")
     )
 
-    if not item or item.get("status") != SESSION_STATUS_ACTIVE:
+    # Leftover practice sessions from before practice was removed are ignored.
+    if not item or item.get("status") != SESSION_STATUS_ACTIVE or item.get("session_type") != SESSION_TYPE_EDIT:
         return None
 
     # DynamoDB TTL deletion is lazy; treat expired sessions as gone.
@@ -1760,416 +1418,7 @@ def get_active_session(telegram_user_id: str) -> dict[str, Any] | None:
 
 
 def clear_session(telegram_user_id: str) -> None:
-    table = get_practice_sessions_table()
-    item = table.get_item(Key={"telegram_user_id": str(telegram_user_id)}, ConsistentRead=True).get("Item")
-
-    if item and item.get("storage_version") == COMPACT_STORAGE_VERSION:
-        mark_session_status(table, user_id=str(telegram_user_id), status="cancelled")
-        return
-
-    table.delete_item(Key={"telegram_user_id": str(telegram_user_id)})
-
-
-# ---------------------------------------------------------------------------
-# Active practice: scoring
-# ---------------------------------------------------------------------------
-
-
-def next_correct_interval(current_interval_days: int) -> int:
-    for interval_days in PRACTICE_CORRECT_INTERVAL_STEPS:
-        if current_interval_days < interval_days:
-            return interval_days
-
-    return PRACTICE_CORRECT_INTERVAL_STEPS[-1]
-
-
-def calculate_next_active_practice(
-    result: str,
-    current_score: int,
-    current_interval_days: int,
-) -> tuple[int, int]:
-    if result == RESULT_CORRECT:
-        practice_score = max(current_score - 1, 0)
-        interval_days = next_correct_interval(current_interval_days)
-    elif result == RESULT_MINOR_ISSUE:
-        practice_score = min(current_score + 1, PRACTICE_MAX_PRIORITY_SCORE)
-        interval_days = min(max(current_interval_days, 1), 3)
-    else:
-        practice_score = min(current_score + 2, PRACTICE_MAX_PRIORITY_SCORE)
-        interval_days = 0
-
-    return practice_score, interval_days
-
-
-def update_word_practice_stats(word_key: str, result: str) -> None:
-    table = get_known_words_table()
-    item = table.get_item(Key={"word_key": word_key}).get("Item") or {}
-    practice_score, interval_days = calculate_next_active_practice(
-        result,
-        int(item.get("practice_score") or 0),
-        int(item.get("practice_interval_days") or 0),
-    )
-    now = datetime.now(timezone.utc)
-    set_parts = [
-        "practice_attempt_count = if_not_exists(practice_attempt_count, :zero) + :one",
-        "last_practiced_at = :now",
-        "last_practice_result = :result",
-        "practice_score = :practice_score",
-        "practice_interval_days = :interval",
-        "next_practice_at = :next_practice_at",
-        "updated_at = :now",
-    ]
-    expression_values = {
-        ":zero": 0,
-        ":one": 1,
-        ":now": now.isoformat(),
-        ":result": result,
-        ":practice_score": practice_score,
-        ":interval": interval_days,
-        ":next_practice_at": (now + timedelta(days=interval_days)).isoformat(),
-    }
-
-    if result == RESULT_HINT_REQUESTED:
-        return
-
-    if result == RESULT_CORRECT:
-        set_parts.append("correct_count = if_not_exists(correct_count, :zero) + :one")
-        set_parts.append("last_correct_at = :now")
-    elif result == RESULT_MINOR_ISSUE:
-        set_parts.append("minor_issue_count = if_not_exists(minor_issue_count, :zero) + :one")
-        set_parts.append("last_minor_issue_at = :now")
-    elif result == RESULT_IDK:
-        set_parts.append("idk_count = if_not_exists(idk_count, :zero) + :one")
-        set_parts.append("last_idk_at = :now")
-    else:
-        set_parts.append("wrong_count = if_not_exists(wrong_count, :zero) + :one")
-        set_parts.append("last_wrong_at = :now")
-
-    table.update_item(
-        Key={"word_key": word_key},
-        UpdateExpression="SET " + ", ".join(set_parts) + remove_expression_for(LEGACY_CARD_SRS_ATTRIBUTES),
-        ExpressionAttributeValues=expression_values,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Active practice: answer evaluation
-# ---------------------------------------------------------------------------
-
-
-def normalize_answer(value: str) -> str:
-    return normalize_text(value)
-
-
-def answer_matches(expected: str, answer: str) -> bool:
-    return answer_match_result(expected, answer) in (RESULT_CORRECT, RESULT_MINOR_ISSUE)
-
-
-def answer_match_result(
-    expected: str,
-    answer: str,
-    accepted_answers: list[str] | None = None,
-) -> str:
-    task = {
-        "expected_answer": expected,
-        "accepted_answers": accepted_answers or [
-            option.strip() for option in expected.split(",") if option.strip()
-        ],
-    }
-    return evaluate_short_answer_locally(task, answer)["result"]
-
-
-def evaluate_fill_blank_answer(task: dict[str, Any], user_answer: str) -> dict[str, str]:
-    return evaluate_short_answer_locally(task, user_answer)
-
-
-def evaluate_own_sentence_answer(
-    task: dict[str, Any],
-    user_answer: str,
-    config: dict[str, str],
-) -> dict[str, str]:
-    precheck = precheck_own_sentence(task, user_answer)
-    if precheck:
-        return precheck
-
-    evaluation = evaluate_sentence_with_gemini(str(task.get("word") or ""), user_answer, config)
-    result_map = {
-        "good": RESULT_CORRECT,
-        "minor_issue": RESULT_MINOR_ISSUE,
-        "wrong_usage": RESULT_WRONG,
-    }
-    result = result_map[evaluation["result"]]
-    target_word_sentence = (
-        evaluation.get("target_word_sentence")
-        or evaluation.get("better_sentence")
-        or ""
-    )
-    if target_word_sentence and not contains_target_phrase(target_word_sentence, str(task.get("word") or "")):
-        target_word_sentence = ""
-    feedback = format_own_sentence_feedback(
-        word=str(task.get("word") or ""),
-        result=result,
-        feedback=evaluation.get("feedback") or "",
-        target_word_sentence=target_word_sentence,
-        natural_alternative=evaluation.get("natural_alternative") or "",
-    )
-
-    return {
-        "result": result,
-        "feedback": feedback or evaluation["result"],
-    }
-
-
-def evaluate_training_task(
-    task: dict[str, Any],
-    user_answer: str,
-    config: dict[str, str],
-) -> dict[str, str]:
-    task_type = task.get("task_type")
-
-    if task_type == TASK_TYPE_FILL_BLANK:
-        return evaluate_fill_blank_answer(task, user_answer)
-
-    if task_type == TASK_TYPE_TRANSLATE_RU_EN:
-        precheck = precheck_translation(task, user_answer)
-        if precheck:
-            return precheck
-        return evaluate_translation_with_gemini(task, user_answer, config)
-
-    if task_type == TASK_TYPE_OWN_SENTENCE:
-        return evaluate_own_sentence_answer(task, user_answer, config)
-
-    raise UserInputError("Unknown practice task.")
-
-
-def result_label(result: str) -> str:
-    if result == RESULT_CORRECT:
-        return "Correct"
-    if result == RESULT_MINOR_ISSUE:
-        return "Minor issue"
-    if result == RESULT_IDK:
-        return "IDK"
-    if result == RESULT_SKIPPED:
-        return "Skipped"
-    if result == RESULT_HINT_REQUESTED:
-        return "Hint"
-    return "Wrong"
-
-
-def update_practice_stats_for_task(task: dict[str, Any], result: str) -> None:
-    if result == RESULT_HINT_REQUESTED:
-        return
-
-    for word_key in task.get("target_word_keys") or task.get("linked_word_keys") or []:
-        update_word_practice_stats(str(word_key), result)
-
-
-def is_compact_practice_session(session: dict[str, Any]) -> bool:
-    return session.get("storage_version") == COMPACT_STORAGE_VERSION
-
-
-def load_session_task(session: dict[str, Any], task_index: int) -> dict[str, Any] | None:
-    if is_compact_practice_session(session):
-        return get_compact_task(
-            get_practice_sessions_table(),
-            user_id=str(session["telegram_user_id"]),
-            session_id=str(session["session_id"]),
-            task_index=task_index,
-        )
-
-    tasks = session.get("tasks") or []
-    if 0 <= task_index < len(tasks):
-        return tasks[task_index]
-
-    return None
-
-
-def load_session_tasks(session: dict[str, Any]) -> list[dict[str, Any]]:
-    if is_compact_practice_session(session):
-        return get_compact_tasks(
-            get_practice_sessions_table(),
-            user_id=str(session["telegram_user_id"]),
-            session_id=str(session["session_id"]),
-            total_tasks=int(session.get("total_tasks") or 0),
-        )
-
-    return list(session.get("tasks") or [])
-
-
-def task_result_for_summary(task: dict[str, Any]) -> str:
-    return str(task.get("evaluation_result") or task.get("result") or "")
-
-
-def build_training_summary(session: dict[str, Any], tasks: list[dict[str, Any]] | None = None) -> str:
-    tasks = tasks if tasks is not None else load_session_tasks(session)
-    legacy_results = {
-        int(item.get("task_index") or 0): str(item.get("result") or "")
-        for item in session.get("evaluation_results") or []
-    }
-    results = [
-        task_result_for_summary(task) or legacy_results.get(index, "")
-        for index, task in enumerate(tasks)
-    ]
-    correct = sum(1 for result in results if result == RESULT_CORRECT)
-    minor = sum(1 for result in results if result == RESULT_MINOR_ISSUE)
-    wrong = sum(1 for result in results if result == RESULT_WRONG)
-    idk = sum(1 for result in results if result == RESULT_IDK)
-    skipped = sum(1 for result in results if result == RESULT_SKIPPED)
-
-    practice_again = []
-    for task, result in zip(tasks, results):
-        if result in (RESULT_CORRECT, RESULT_HINT_REQUESTED, ""):
-            continue
-
-        word = str(task.get("word") or "")
-        if word and word not in practice_again:
-            practice_again.append(word)
-
-    lines = [
-        "Готово.",
-        "",
-        f"Correct: {correct}",
-        f"Minor issues: {minor}",
-        f"Wrong: {wrong}",
-    ]
-    if idk:
-        lines.append(f"IDK: {idk}")
-    if skipped:
-        lines.append(f"Skipped: {skipped}")
-
-    if practice_again:
-        lines += ["", "Слова, которые стоит потренировать еще:"]
-        lines += [f"- {html.escape(word)}" for word in practice_again]
-
-    return "\n".join(lines)
-
-
-def handle_practice_answer(
-    session: dict[str, Any],
-    user_text: str,
-    config: dict[str, str],
-) -> tuple[str, dict[str, Any] | None]:
-    total_tasks = int(session.get("total_tasks") or len(session.get("tasks") or []))
-    current_task_index = int(session.get("current_task_index") or 0)
-
-    if current_task_index >= total_tasks:
-        tasks = load_session_tasks(session)
-        if is_compact_practice_session(session):
-            mark_session_status(
-                get_practice_sessions_table(),
-                user_id=str(session["telegram_user_id"]),
-                status="completed",
-            )
-        else:
-            clear_session(str(session["telegram_user_id"]))
-        return build_training_summary(session, tasks), None
-
-    task = load_session_task(session, current_task_index)
-    if not task:
-        clear_session(str(session["telegram_user_id"]))
-        return GENERIC_ERROR_TEXT, None
-
-    if is_hint_text(user_text):
-        hint = build_hint(task)
-        return (
-            "\n\n".join(
-                [
-                    html.escape(hint),
-                    build_task_prompt(task, current_task_index + 1, total_tasks),
-                ]
-            ),
-            build_practice_task_keyboard(),
-        )
-
-    if is_idk_text(user_text):
-        evaluation = {
-            "result": RESULT_IDK,
-            "feedback": f"Correct answer: {task.get('expected_answer')}",
-        }
-    else:
-        evaluation = evaluate_training_task(task, user_text, config)
-
-    result = evaluation["result"]
-    update_practice_stats_for_task(task, result)
-
-    next_task_index = current_task_index + 1
-    completed = next_task_index >= total_tasks
-
-    if is_compact_practice_session(session):
-        table = get_practice_sessions_table()
-        save_task_result(
-            table,
-            user_id=str(session["telegram_user_id"]),
-            session_id=str(session["session_id"]),
-            task_index=current_task_index,
-            user_answer=user_text,
-            evaluation=evaluation,
-        )
-        advance_session(
-            table,
-            user_id=str(session["telegram_user_id"]),
-            next_task_index=next_task_index,
-            result=result,
-            completed=completed,
-        )
-        updated_session = {
-            **session,
-            "current_task_index": next_task_index,
-        }
-    else:
-        user_answers = list(session.get("user_answers") or [])
-        evaluation_results = list(session.get("evaluation_results") or [])
-        user_answers.append(
-            {
-                "task_index": current_task_index,
-                "answer": user_text,
-                "answered_at": utc_now_iso(),
-            }
-        )
-        evaluation_results.append(
-            {
-                "task_index": current_task_index,
-                "task_type": task.get("task_type"),
-                "result": result,
-                "feedback": evaluation.get("feedback") or "",
-                "evaluated_at": utc_now_iso(),
-            }
-        )
-        updated_session = {
-            **session,
-            "current_task_index": next_task_index,
-            "user_answers": user_answers,
-            "evaluation_results": evaluation_results,
-            "updated_at": utc_now_iso(),
-        }
-
-    feedback_lines = [
-        f"{result_label(result)}.",
-    ]
-    if evaluation.get("feedback"):
-        feedback_lines.append(html.escape(evaluation["feedback"]))
-
-    if completed:
-        if not is_compact_practice_session(updated_session):
-            updated_session["completed_at"] = utc_now_iso()
-            clear_session(str(session["telegram_user_id"]))
-        tasks = load_session_tasks(updated_session)
-        return "\n".join(feedback_lines + ["", build_training_summary(updated_session, tasks)]), None
-
-    next_task = load_session_task(updated_session, next_task_index)
-    if not next_task:
-        clear_session(str(session["telegram_user_id"]))
-        return "\n".join(feedback_lines + ["", GENERIC_ERROR_TEXT]), None
-
-    if not is_compact_practice_session(updated_session):
-        save_session(str(session["telegram_user_id"]), updated_session)
-
-    return "\n\n".join(
-        [
-            "\n".join(feedback_lines),
-            build_task_prompt(next_task, next_task_index + 1, total_tasks),
-        ]
-    ), build_practice_task_keyboard()
+    get_sessions_table().delete_item(Key={"telegram_user_id": str(telegram_user_id)})
 
 
 # ---------------------------------------------------------------------------
@@ -2180,17 +1429,11 @@ def handle_practice_answer(
 def parse_card_input_text(text: str) -> CardInput:
     parts = [part.strip() for part in text.split("|")]
 
-    if len(parts) not in (4, 5) or any(not part for part in parts[:4]):
+    if len(parts) != 4 or any(not part for part in parts):
         raise UserInputError(EDIT_CARD_PROMPT)
 
-    cloze_sentence = parts[4] if len(parts) == 5 and parts[4] else None
-    return CardInput(
-        word=parts[0],
-        translation=parts[1],
-        usage=parts[2],
-        example=parts[3],
-        cloze_sentence=cloze_sentence,
-    )
+    word, translation, usage, example = parts
+    return CardInput(word=word, translation=translation, usage=usage, example=example)
 
 
 def build_edit_card_prompt(item: dict[str, Any]) -> str:
@@ -2224,13 +1467,13 @@ def start_edit_card_session(
 
     session = {
         "telegram_user_id": str(telegram_user_id),
-        "session_type": PRACTICE_SESSION_TYPE_EDIT,
+        "session_type": SESSION_TYPE_EDIT,
         "word_key": word_key,
         "created_at": utc_now_iso(),
-        "expires_at": int(time.time()) + PRACTICE_SESSION_TTL_SECONDS,
+        "expires_at": int(time.time()) + EDIT_SESSION_TTL_SECONDS,
         "status": SESSION_STATUS_ACTIVE,
     }
-    save_session(str(telegram_user_id), session)
+    save_session(session)
 
     return build_edit_card_prompt(item), build_inline_keyboard(
         (
@@ -2255,102 +1498,6 @@ def handle_edit_card_answer(
 
 
 # ---------------------------------------------------------------------------
-# Active practice: stats
-# ---------------------------------------------------------------------------
-
-
-def build_stats_reply() -> str:
-    words = get_known_words_for_practice(limit=STATS_SCAN_LIMIT)
-    practiced = sum(1 for item in words if int(item.get("practice_attempt_count") or 0) > 0)
-    attempts = sum(int(item.get("practice_attempt_count") or 0) for item in words)
-    correct = sum(int(item.get("correct_count") or 0) for item in words)
-    minor = sum(int(item.get("minor_issue_count") or 0) for item in words)
-    wrong = sum(int(item.get("wrong_count") or 0) for item in words)
-    idk = sum(int(item.get("idk_count") or 0) for item in words)
-    accuracy = round(correct / attempts * 100) if attempts else 0
-
-    return (
-        f"Total words: {len(words)}\n"
-        f"Practiced words: {practiced}\n"
-        f"Practice attempts: {attempts}\n"
-        f"Correct: {correct}\n"
-        f"Minor issues: {minor}\n"
-        f"Wrong: {wrong}\n"
-        f"IDK: {idk}\n"
-        f"Practice accuracy: {accuracy}%"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Migration
-# ---------------------------------------------------------------------------
-
-
-def migrate_legacy_practice_item(item: dict[str, Any], now_iso: str) -> dict[str, Any]:
-    needs_migration = any(attribute in item for attribute in LEGACY_CARD_SRS_ATTRIBUTES)
-    needs_migration = needs_migration or any(
-        attribute not in item
-        for attribute in (
-            "practice_attempt_count",
-            "correct_count",
-            "wrong_count",
-            "minor_issue_count",
-            "idk_count",
-            "practice_score",
-            "practice_interval_days",
-            "next_practice_at",
-        )
-    )
-
-    if not needs_migration:
-        return item
-
-    migrated = dict(item)
-    correct_count = int(migrated.get("correct_count") or 0)
-    wrong_count = int(migrated.get("wrong_count") or 0)
-    minor_issue_count = int(migrated.get("minor_issue_count") or 0)
-    idk_count = int(migrated.get("idk_count") or 0)
-
-    migrated.setdefault("practice_attempt_count", int(migrated.get("review_count") or 0))
-    migrated.setdefault("correct_count", correct_count)
-    migrated.setdefault("wrong_count", wrong_count)
-    migrated.setdefault("minor_issue_count", minor_issue_count)
-    migrated.setdefault("idk_count", idk_count)
-    migrated.setdefault(
-        "practice_score",
-        min(wrong_count * 2 + minor_issue_count, PRACTICE_MAX_PRIORITY_SCORE),
-    )
-    migrated.setdefault("practice_interval_days", 0)
-    migrated.setdefault("next_practice_at", now_iso)
-    migrated["updated_at"] = now_iso
-
-    for attribute in LEGACY_CARD_SRS_ATTRIBUTES:
-        migrated.pop(attribute, None)
-
-    return migrated
-
-
-def migrate_legacy_practice_stats() -> dict[str, Any]:
-    table = get_known_words_table()
-    now_iso = utc_now_iso()
-    scanned = 0
-    migrated_count = 0
-
-    for item in scan_known_word_items():
-        scanned += 1
-        migrated = migrate_legacy_practice_item(item, now_iso)
-
-        if migrated == item:
-            continue
-
-        table.put_item(Item=migrated)
-        migrated_count += 1
-
-    log_event("legacy_practice_stats_migrated", scanned=scanned, migrated=migrated_count)
-    return {"ok": True, "scanned": scanned, "migrated": migrated_count}
-
-
-# ---------------------------------------------------------------------------
 # Route handlers
 # ---------------------------------------------------------------------------
 
@@ -2369,17 +1516,10 @@ def handle_add_card(event: dict[str, Any]) -> dict[str, Any]:
         translation=require_string_field(data, "translation"),
         usage=require_string_field(data, "usage"),
         example=require_string_field(data, "example"),
-        cloze_sentence=optional_string_field(data, "cloze_sentence"),
     )
 
-    result = add_card(card, config, source="api")
+    result = add_card(card, config, destination=DESTINATION_MOCHI, source="api")
     return json_response(200, result.to_dict())
-
-
-def handle_migrate_practice_stats(event: dict[str, Any]) -> dict[str, Any]:
-    config = get_app_config()
-    require_secret_header(event, "x-bot-secret", config["APP_SECRET"])
-    return json_response(200, migrate_legacy_practice_stats())
 
 
 def handle_sync_telegram_commands(event: dict[str, Any]) -> dict[str, Any]:
@@ -2388,48 +1528,35 @@ def handle_sync_telegram_commands(event: dict[str, Any]) -> dict[str, Any]:
     return json_response(200, sync_telegram_bot_commands(config))
 
 
-def dispatch_callback(data: str, user_id: str, config: dict[str, str]) -> tuple[str, dict[str, Any] | None] | None:
-    """Returns (reply, reply_markup) for known callback_data, None for unknown."""
+def dispatch_callback(data: str, user_id: str, config: dict[str, str]) -> list[Reply] | None:
+    """Returns the messages to send for known callback_data, None for unknown."""
+    if data == CALLBACK_INBOX_PROMOTE:
+        return build_inbox_promote_replies(config)
+
+    if data.startswith(CALLBACK_TO_MOCHI_PREFIX):
+        word_key = build_word_key(deck_id=config["MOCHI_DECK_ID"], normalized_word=data[len(CALLBACK_TO_MOCHI_PREFIX):])
+        return [build_add_result_reply(send_known_word_to_mochi(word_key, config))]
+
+    if data.startswith(CALLBACK_TO_INBOX_PREFIX):
+        word_key = build_word_key(deck_id=config["MOCHI_DECK_ID"], normalized_word=data[len(CALLBACK_TO_INBOX_PREFIX):])
+        return [build_add_result_reply(move_known_word_to_inbox(word_key))]
+
     if data.startswith(CALLBACK_REGEN_PREFIX):
         result = regenerate_card(data[len(CALLBACK_REGEN_PREFIX):], config)
-        return build_add_result_reply(result, title="Regenerated")
+        return [build_add_result_reply(result, title="Regenerated")]
 
     if data.startswith(CALLBACK_EDIT_PREFIX):
-        return start_edit_card_session(data[len(CALLBACK_EDIT_PREFIX):], user_id, config)
+        return [start_edit_card_session(data[len(CALLBACK_EDIT_PREFIX):], user_id, config)]
 
     if data.startswith(CALLBACK_DELETE_CONFIRM_PREFIX):
-        return delete_known_word(data[len(CALLBACK_DELETE_CONFIRM_PREFIX):], config), None
+        return [(delete_known_word(data[len(CALLBACK_DELETE_CONFIRM_PREFIX):], config), None)]
 
     if data.startswith(CALLBACK_DELETE_PREFIX):
-        return build_delete_confirmation(data[len(CALLBACK_DELETE_PREFIX):], config)
+        return [build_delete_confirmation(data[len(CALLBACK_DELETE_PREFIX):], config)]
 
     if data == CALLBACK_CANCEL:
         clear_session(user_id)
-        return CANCELLED_TEXT, None
-
-    if not data.startswith("practice:"):
-        return None
-
-    choice = data.split(":", 1)[1]
-    log_event("practice_callback", choice=choice)
-
-    if data == CALLBACK_PRACTICE_HINT:
-        session = get_active_session(user_id)
-        if not session or session.get("session_type") != PRACTICE_SESSION_TYPE_ACTIVE:
-            return "No active practice session.", None
-        return handle_practice_answer(session, "hint", config)
-
-    if data == CALLBACK_PRACTICE_IDK:
-        session = get_active_session(user_id)
-        if not session or session.get("session_type") != PRACTICE_SESSION_TYPE_ACTIVE:
-            return "No active practice session.", None
-        return handle_practice_answer(session, "idk", config)
-
-    if choice == "stats":
-        return build_stats_reply(), None
-
-    if choice == "today":
-        return start_today_practice_session(user_id, config)
+        return [(CANCELLED_TEXT, None)]
 
     return None
 
@@ -2446,22 +1573,19 @@ def handle_callback_query(callback_query: dict[str, Any], config: dict[str, str]
     if not chat_id or not user_id:
         return
 
-    reply_markup = None
-
     try:
-        dispatched = dispatch_callback(data, str(user_id), config)
-        if dispatched is None:
+        replies = dispatch_callback(data, str(user_id), config)
+        if replies is None:
             return
-        reply, reply_markup = dispatched
     except UserInputError as error:
-        reply = str(error)
+        replies = [(str(error), None)]
     except AiGenerationError:
-        reply = "AI could not complete this request. Please try again later."
+        replies = [(AI_ERROR_TEXT, None)]
     except Exception as error:
         log_event("callback_error", error_type=type(error).__name__)
-        reply = GENERIC_ERROR_TEXT
+        replies = [(GENERIC_ERROR_TEXT, None)]
 
-    send_telegram_message(chat_id=chat_id, text=reply, config=config, reply_markup=reply_markup)
+    send_telegram_replies(chat_id=chat_id, replies=replies, config=config)
 
 
 def handle_telegram_webhook(event: dict[str, Any]) -> dict[str, Any]:
@@ -2487,22 +1611,19 @@ def handle_telegram_webhook(event: dict[str, Any]) -> dict[str, Any]:
         return json_response(200, {"ok": True, "ignored": True})
 
     telegram_user_id = str((message.get("from") or {}).get("id") or chat_id)
-    reply_markup = None
 
     try:
-        reply, reply_markup = process_telegram_text(
-            text, config, telegram_user_id=telegram_user_id
-        )
+        replies = process_telegram_text(text, config, telegram_user_id=telegram_user_id)
     except UserInputError as error:
         # Input-format errors quote HELP_TEXT, so attach the help buttons too.
-        reply, reply_markup = str(error), build_help_menu()
+        replies = [(str(error), build_help_menu())]
     except AiGenerationError:
-        reply = "AI could not complete this request. Please try again later."
+        replies = [(AI_ERROR_TEXT, None)]
     except Exception as error:
         log_event("telegram_processing_error", error_type=type(error).__name__)
-        reply = GENERIC_ERROR_TEXT
+        replies = [(GENERIC_ERROR_TEXT, None)]
 
-    send_telegram_message(chat_id=chat_id, text=reply, config=config, reply_markup=reply_markup)
+    send_telegram_replies(chat_id=chat_id, replies=replies, config=config)
 
     # Always 200 so Telegram does not retry handled updates.
     return json_response(200, {"ok": True})
@@ -2525,9 +1646,6 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
 
         if method == "POST" and path == "/add-card":
             return handle_add_card(event)
-
-        if method == "POST" and path == "/migrate-practice-stats":
-            return handle_migrate_practice_stats(event)
 
         if method == "POST" and path == "/sync-telegram-commands":
             return handle_sync_telegram_commands(event)

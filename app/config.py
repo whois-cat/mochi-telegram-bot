@@ -46,42 +46,54 @@ USAGE_ALIASES = {
     "phrasal verb": "phrasal-verb",
 }
 
+# DRAFT: generated but not sent anywhere yet. INBOX: parked, not in Mochi.
+# RESERVED -> CREATED: being sent to / now in Mochi. FAILED: Mochi request failed.
+STATUS_DRAFT = "DRAFT"
+STATUS_INBOX = "INBOX"
 STATUS_RESERVED = "RESERVED"
 STATUS_CREATED = "CREATED"
 STATUS_FAILED = "FAILED"
 
+DESTINATION_MOCHI = "mochi"
+DESTINATION_INBOX = "inbox"
+
+# Card-generating commands and where they send the card. None = draft with buttons.
+AI_COMMAND_DESTINATIONS = {
+    "/ai": None,
+    "/mochi": DESTINATION_MOCHI,
+    "/inbox": DESTINATION_INBOX,
+}
+
+# Gemini's frequency estimate; anything else is dropped. Also used as Mochi tags.
+FREQUENCY_VALUES = ("common", "moderate", "rare")
+CEFR_LEVELS = ("A1", "A2", "B1", "B2", "C1", "C2")
+
 # ---------------------------------------------------------------------------
-# Active practice
+# Inbox
 # ---------------------------------------------------------------------------
 
-PRACTICE_MODE_TODAY = "today"
-PRACTICE_SESSION_TYPE_ACTIVE = "active_practice"
-PRACTICE_SESSION_TYPE_EDIT = "edit_card"
-TASK_TYPE_FILL_BLANK = "fill_blank"
-TASK_TYPE_TRANSLATE_RU_EN = "translate_ru_en"
-TASK_TYPE_OWN_SENTENCE = "own_sentence"
+INBOX_LIST_LIMIT = 20
+# From this many sightings the card reply suggests moving the word to Mochi.
+INBOX_SUGGEST_SEEN_COUNT = 3
+# "Move seen 2+ to Mochi" button: threshold and words per press (Lambda timeout).
+INBOX_PROMOTE_MIN_SEEN = 2
+INBOX_PROMOTE_BATCH = 10
 
-PRACTICE_QUESTION_COUNT = 30
-PRACTICE_BLOCK_QUESTION_COUNT = 10
-PRACTICE_SCAN_LIMIT = 5_000
-STATS_SCAN_LIMIT = 500
-PRACTICE_SESSION_TTL_SECONDS = 3600
-ANSWER_FUZZY_MATCH_THRESHOLD = 0.85
+# /ai with several words (one per line or separated by ";"). Kept small so the
+# whole batch fits the 30s Lambda timeout and Gemini rate limits.
+BULK_AI_MAX_WORDS = 10
+BULK_AI_MAX_WORKERS = 5
+BULK_AI_SEPARATORS_PATTERN = r"[\n;]+"
+# Leading list markers people paste: "- ", "* ", "• ", "1. ", "2) ".
+BULK_AI_LIST_MARKER_PATTERN = r"^\s*(?:[-*•]|\d+[.)])\s+"
 
+# ---------------------------------------------------------------------------
+# Edit sessions
+# ---------------------------------------------------------------------------
+
+SESSION_TYPE_EDIT = "edit_card"
 SESSION_STATUS_ACTIVE = "active"
-
-RESULT_CORRECT = "correct"
-RESULT_MINOR_ISSUE = "minor_issue"
-RESULT_WRONG = "wrong"
-RESULT_IDK = "idk"
-RESULT_HINT_REQUESTED = "hint_requested"
-RESULT_SKIPPED = "skipped"
-
-# Lightweight scheduling for Telegram exercises only. Mochi remains the SRS.
-PRACTICE_CORRECT_INTERVAL_STEPS = (1, 3, 7, 14, 30)
-PRACTICE_MAX_PRIORITY_SCORE = 10
-PRACTICE_HISTORY_TTL_SECONDS = 30 * 24 * 60 * 60
-SHORT_FEEDBACK_MAX_CHARS = 500
+EDIT_SESSION_TTL_SECONDS = 3600
 LEGACY_CARD_SRS_ATTRIBUTES = (
     "review_count",
     "streak",
@@ -91,8 +103,6 @@ LEGACY_CARD_SRS_ATTRIBUTES = (
     "last_reviewed_at",
 )
 
-CLOZE_BLANK = "_____"
-
 # ---------------------------------------------------------------------------
 # User-facing texts
 # ---------------------------------------------------------------------------
@@ -101,81 +111,86 @@ HELP_TEXT = (
     "Manual:\n"
     "/add reliable | надежный | adjective | This is a reliable source.\n"
     "\n"
-    "AI:\n"
+    "AI draft (then pick Mochi or Inbox on the buttons):\n"
     "/ai reliable\n"
+    "\n"
+    "AI, straight to Mochi or Inbox:\n"
+    "/mochi reliable\n"
+    "/inbox reliable\n"
+    "\n"
+    "Several words: one per line or separated by \";\":\n"
+    "/ai reliable\n"
+    "take for granted\n"
+    "so far this month\n"
+    "\n"
+    "Inbox list:\n"
+    "/inbox\n"
     "\n"
     "Delete:\n"
     "/delete reliable\n"
     "\n"
-    "Practice:\n"
-    "/today\n"
-    "\n"
-    "Cancel edit/practice:\n"
+    "Cancel edit:\n"
     "/cancel\n"
     "\n"
-    "Everything else is on the buttons below."
+    "Regenerate / Edit / Delete are on the buttons under each card."
 )
 
 GENERIC_ERROR_TEXT = "Something went wrong. Please try again later."
+AI_ERROR_TEXT = "AI could not complete this request. Please try again later."
+BULK_AI_TOO_MANY_TEXT = "Up to {limit} words at a time, please. You sent {count}."
+BULK_AI_FAILED_LABEL = "❌ Failed"
 
-NOT_ENOUGH_WORDS_TEXT = "Need at least 30 saved words for active practice."
-TODAY_PRACTICE_INTRO = "Today's active practice. Fill in the blanks:"
 EDIT_CARD_PROMPT = (
     "Send the updated card in this format:\n\n"
-    "word | translation | usage | example\n\n"
-    "You can also add a fifth field for a cloze sentence."
+    "word | translation | usage | example"
 )
 
 # Shown under help / unknown-command replies.
-HELP_MENU_BUTTONS = (
-    (
-        ("Today", "practice:today"),
-        ("Stats", "practice:stats"),
-    ),
-)
+HELP_MENU_BUTTONS: tuple = ()
 
 TELEGRAM_BOT_COMMANDS = (
-    {"command": "add", "description": "Add a card manually"},
-    {"command": "ai", "description": "Generate and add a card"},
+    {"command": "add", "description": "Add a card draft manually"},
+    {"command": "ai", "description": "Generate a card draft"},
+    {"command": "mochi", "description": "Generate a card and send it to Mochi"},
+    {"command": "inbox", "description": "Show inbox, or generate a card into it"},
     {"command": "delete", "description": "Delete a card"},
-    {"command": "today", "description": "Start active practice"},
-    {"command": "stats", "description": "Show active practice stats"},
-    {"command": "cancel", "description": "Cancel current edit or practice"},
+    {"command": "cancel", "description": "Cancel current edit"},
 )
 
-IDK_BUTTON_TEXT = "IDK"
-HINT_BUTTON_TEXT = "Hint"
 REGENERATE_BUTTON_TEXT = "Regenerate"
 EDIT_BUTTON_TEXT = "Edit"
 DELETE_BUTTON_TEXT = "Delete"
 CONFIRM_DELETE_BUTTON_TEXT = "Yes, delete"
 CANCEL_BUTTON_TEXT = "Cancel"
+TO_MOCHI_BUTTON_TEXT = "📚 To Mochi"
+TO_INBOX_BUTTON_TEXT = "📥 Inbox"
+INBOX_PROMOTE_BUTTON_TEXT = "📚 Move seen {min_seen}+ times to Mochi"
+INBOX_DELETE_BUTTON_TEXT = "🗑"
 
 CALLBACK_REGEN_PREFIX = "regen:"
 CALLBACK_EDIT_PREFIX = "edit:"
 CALLBACK_DELETE_PREFIX = "del:"
 CALLBACK_DELETE_CONFIRM_PREFIX = "delc:"
 CALLBACK_CANCEL = "cancel"
-CALLBACK_PRACTICE_IDK = "practice:idk"
-CALLBACK_PRACTICE_HINT = "practice:hint"
+CALLBACK_TO_MOCHI_PREFIX = "mochi:"
+CALLBACK_TO_INBOX_PREFIX = "inbox:"
+CALLBACK_INBOX_PROMOTE = "inbox_promote"
 TELEGRAM_CALLBACK_DATA_MAX_BYTES = 64
 
-IDK_TEXT_EQUIVALENTS = (
-    "idk",
-    "i don't know",
-    "i dont know",
-    "не знаю",
-    "не помню",
-    "забыла",
-    "не помню как переводится",
-)
-HINT_TEXT_EQUIVALENTS = (
-    "hint",
-    "подсказка",
-    "дай подсказку",
-)
-
 WORD_NOT_FOUND_TEXT = "Word not found."
+INBOX_EMPTY_TEXT = "Inbox is empty."
+INBOX_NOTHING_TO_PROMOTE_TEXT = "No inbox words seen {min_seen}+ times."
+DRAFT_HINT_TEXT = "Not saved to Mochi or Inbox yet — pick one below."
+INBOX_SUGGEST_TEXT = "Keeps coming up — maybe time to send it to Mochi?"
+
+WORD_STATUS_TITLES = {
+    STATUS_DRAFT: "📝 Draft",
+    STATUS_INBOX: "📥 In inbox",
+    STATUS_RESERVED: "⏳ Sending to Mochi",
+    STATUS_CREATED: "✅ In Mochi",
+    STATUS_FAILED: "⚠️ Mochi request failed",
+}
+ALREADY_IN_MOCHI_TITLE = "🔁 Already in Mochi"
 CANCELLED_TEXT = "Cancelled."
 
 # Front side: only the word (H2 so it is not oversized). Back side: translation
