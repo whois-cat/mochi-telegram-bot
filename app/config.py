@@ -22,7 +22,33 @@ TELEGRAM_API_BASE = "https://api.telegram.org"
 
 MOCHI_TIMEOUT_SECONDS = 15
 TELEGRAM_TIMEOUT_SECONDS = 10
-GEMINI_TIMEOUT_MS = 30_000
+
+# Gemini model chain: GEMINI_MODEL holds one model or several, comma-separated,
+# e.g. "gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemini-3.5-flash".
+# Models are tried in order; the next one is used when the previous is
+# overloaded (503), out of quota (429), times out or returns broken JSON.
+GEMINI_MODEL_SEPARATOR = ","
+# One attempt never waits longer than this (and never past the deadline).
+GEMINI_ATTEMPT_TIMEOUT_MS = 8_000
+# The SDK also sends the timeout to Gemini as a server deadline, and Gemini
+# rejects deadlines under 10s (400 INVALID_ARGUMENT). The server deadline is
+# kept at least this long; the client still gives up after the attempt timeout.
+GEMINI_SERVER_MIN_TIMEOUT_SECONDS = 10
+# Do not start an attempt with less time than this left before the deadline.
+GEMINI_MIN_ATTEMPT_MS = 1_500
+# Time budget for all Gemini calls of one request. The Lambda timeout is 30s:
+# the rest is left for DynamoDB/Mochi writes and the Telegram reply.
+GEMINI_DEADLINE_SECONDS = 18
+# These errors will not be fixed by another model: stop instead of falling back.
+GEMINI_NON_RETRYABLE_CODES = frozenset({400, 401, 403})
+# A model that just failed (503/429/timeout) is skipped for this long, so the
+# other words of a list go straight to the next model.
+GEMINI_MODEL_COOLDOWN_SECONDS = 120
+
+# Telegram retries an update until the webhook answers 200. A processed
+# update_id is remembered this long so a retry is not handled twice.
+TELEGRAM_UPDATE_DEDUP_TTL_SECONDS = 24 * 3600
+TELEGRAM_UPDATE_KEY_PREFIX = "update#"
 
 REQUIRED_SECRET_KEYS = (
     "MOCHI_API_KEY",
@@ -250,6 +276,16 @@ def get_app_config() -> dict[str, str]:
         raise RuntimeError(f"Missing app config keys: {', '.join(missing)}")
 
     return {key: str(config[key]) for key in REQUIRED_SECRET_KEYS}
+
+
+def get_gemini_models(config: dict[str, str]) -> list[str]:
+    """GEMINI_MODEL as an ordered, de-duplicated list of models to try."""
+    models: list[str] = []
+    for model in config["GEMINI_MODEL"].split(GEMINI_MODEL_SEPARATOR):
+        model = model.strip()
+        if model and model not in models:
+            models.append(model)
+    return models
 
 
 def get_known_words_table_name() -> str:

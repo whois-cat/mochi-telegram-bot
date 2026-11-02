@@ -4,7 +4,9 @@ import base64
 import hmac
 import html
 import json
+import math
 import re
+import threading
 import time
 import unicodedata
 from collections.abc import Callable
@@ -49,7 +51,12 @@ from app.config import (
     EDIT_SESSION_TTL_SECONDS,
     FAILED_LINE,
     FREQUENCY_VALUES,
-    GEMINI_TIMEOUT_MS,
+    GEMINI_ATTEMPT_TIMEOUT_MS,
+    GEMINI_DEADLINE_SECONDS,
+    GEMINI_MIN_ATTEMPT_MS,
+    GEMINI_MODEL_COOLDOWN_SECONDS,
+    GEMINI_NON_RETRYABLE_CODES,
+    GEMINI_SERVER_MIN_TIMEOUT_SECONDS,
     GENERIC_ERROR_TEXT,
     HELP_TEXT,
     INBOX_EMPTY_TEXT,
@@ -78,12 +85,15 @@ from app.config import (
     TELEGRAM_BOT_COMMANDS,
     TELEGRAM_CALLBACK_DATA_MAX_BYTES,
     TELEGRAM_TIMEOUT_SECONDS,
+    TELEGRAM_UPDATE_DEDUP_TTL_SECONDS,
+    TELEGRAM_UPDATE_KEY_PREFIX,
     TO_INBOX_BUTTON_TEXT,
     TO_MOCHI_BUTTON_TEXT,
     USAGE_ALIASES,
     WORD_NOT_FOUND_TEXT,
     WORD_STATUS_LABELS,
     get_app_config,
+    get_gemini_models,
     get_known_words_table_name,
     get_practice_sessions_table_name,
     load_prompt,
@@ -176,10 +186,11 @@ def log_event(message: str, **fields: Any) -> None:
     print(json.dumps({"message": message, **fields}, ensure_ascii=False))
 
 
-def log_gemini_request_error(error: Exception) -> None:
+def log_gemini_request_error(error: Exception, *, model: str) -> None:
     # code/status exist only on google.genai APIError, not on timeouts/network errors.
     log_event(
         "gemini_request_error",
+        model=model,
         error_type=type(error).__name__,
         code=getattr(error, "code", None),
         status=getattr(error, "status", None),
@@ -577,34 +588,112 @@ def delete_mochi_card(card_id: str, config: dict[str, str]) -> None:
 # ---------------------------------------------------------------------------
 
 
-def generate_card_with_ai(word_or_phrase: str, config: dict[str, str]) -> CardInput:
+# model -> time.monotonic() until which the model is skipped. Lives as long as
+# the warm Lambda container; shared by the worker threads of one bulk request.
+_gemini_cooldowns: dict[str, float] = {}
+_gemini_cooldowns_lock = threading.Lock()
+
+
+def gemini_deadline() -> float:
+    """time.monotonic() by which all Gemini calls of one request must finish."""
+    return time.monotonic() + GEMINI_DEADLINE_SECONDS
+
+
+def is_model_cooling_down(model: str) -> bool:
+    with _gemini_cooldowns_lock:
+        return _gemini_cooldowns.get(model, 0.0) > time.monotonic()
+
+
+def start_model_cooldown(model: str) -> None:
+    with _gemini_cooldowns_lock:
+        _gemini_cooldowns[model] = time.monotonic() + GEMINI_MODEL_COOLDOWN_SECONDS
+
+
+def is_retryable_gemini_error(error: Exception) -> bool:
+    """503/429/5xx, timeouts and network errors: another model may work."""
+    return getattr(error, "code", None) not in GEMINI_NON_RETRYABLE_CODES
+
+
+def request_gemini_text(prompt: str, *, model: str, config: dict[str, str], timeout_ms: int) -> str:
+    """One Gemini call; the only place that talks to the SDK."""
+    server_timeout_seconds = max(GEMINI_SERVER_MIN_TIMEOUT_SECONDS, math.ceil(timeout_ms / 1000))
+    client = genai.Client(
+        api_key=config["GEMINI_API_KEY"],
+        http_options=genai_types.HttpOptions(
+            timeout=timeout_ms,
+            headers={"X-Server-Timeout": str(server_timeout_seconds)},
+        ),
+    )
+    response = client.models.generate_content(
+        model=model,
+        contents=prompt,
+        config=genai_types.GenerateContentConfig(
+            response_mime_type="application/json",
+        ),
+    )
+    return (response.text or "").strip()
+
+
+def generate_card_with_ai(
+    word_or_phrase: str,
+    config: dict[str, str],
+    *,
+    deadline: float | None = None,
+) -> CardInput:
     """
     Ask Gemini for a full card as strict JSON and validate it.
-    All Gemini-specific code lives here.
+
+    Models from GEMINI_MODEL are tried in order until one returns a valid card.
+    A model that is overloaded, out of quota or too slow is put on cooldown so
+    the next words go straight to the next model. Nothing runs past `deadline`.
     """
     if genai is None:
         log_event("gemini_sdk_missing")
         raise AiGenerationError("google-genai SDK is not installed")
 
-    client = genai.Client(
-        api_key=config["GEMINI_API_KEY"],
-        http_options=genai_types.HttpOptions(timeout=GEMINI_TIMEOUT_MS),
-    )
+    deadline = deadline if deadline is not None else gemini_deadline()
+    prompt = load_prompt("gemini_card").replace("{word}", word_or_phrase)
 
-    try:
-        response = client.models.generate_content(
-            model=config["GEMINI_MODEL"],
-            contents=load_prompt("gemini_card").replace("{word}", word_or_phrase),
-            config=genai_types.GenerateContentConfig(
-                response_mime_type="application/json",
-            ),
-        )
-    except Exception as error:
-        log_gemini_request_error(error)
-        raise AiGenerationError("Gemini request failed") from error
+    models = get_gemini_models(config)
+    ready = [model for model in models if not is_model_cooling_down(model)]
+    for model in models:
+        if model not in ready:
+            log_event("gemini_model_skipped", model=model, reason="cooldown")
+    # Every model is cooling down: still try them rather than fail without a call.
+    candidates = ready or models
 
-    raw_text = (response.text or "").strip()
+    for attempt, model in enumerate(candidates, start=1):
+        remaining_ms = int((deadline - time.monotonic()) * 1000)
+        if remaining_ms < GEMINI_MIN_ATTEMPT_MS:
+            log_event("gemini_model_skipped", model=model, reason="deadline")
+            break
 
+        timeout_ms = min(GEMINI_ATTEMPT_TIMEOUT_MS, remaining_ms)
+        try:
+            raw_text = request_gemini_text(prompt, model=model, config=config, timeout_ms=timeout_ms)
+        except Exception as error:
+            log_gemini_request_error(error, model=model)
+            if not is_retryable_gemini_error(error):
+                raise AiGenerationError("Gemini request failed") from error
+            # A timeout on a deadline-shortened attempt says nothing about the model.
+            if getattr(error, "code", None) is not None or timeout_ms == GEMINI_ATTEMPT_TIMEOUT_MS:
+                start_model_cooldown(model)
+            continue
+
+        try:
+            card = parse_ai_card(raw_text)
+        except AiGenerationError:
+            # A one-off bad answer: try the next model, but no cooldown.
+            continue
+
+        log_event("gemini_model_used", model=model, attempt=attempt)
+        return card
+
+    raise AiGenerationError("No Gemini model returned a card")
+
+
+def parse_ai_card(raw_text: str) -> CardInput:
+    """Validate Gemini's JSON answer into a CardInput."""
     # Defensive: strip accidental markdown code fences.
     if raw_text.startswith("```"):
         raw_text = raw_text.strip("`")
@@ -768,9 +857,9 @@ def split_bulk_words(text: str) -> list[str]:
     return words
 
 
-def generate_card_or_none(word_or_phrase: str, config: dict[str, str]) -> CardInput | None:
+def generate_card_or_none(word_or_phrase: str, config: dict[str, str], *, deadline: float) -> CardInput | None:
     try:
-        return generate_card_with_ai(word_or_phrase, config)
+        return generate_card_with_ai(word_or_phrase, config, deadline=deadline)
     except AiGenerationError:
         return None
 
@@ -794,7 +883,11 @@ def add_ai_cards(
     /ai, /mochi and /inbox for one or many words. Existing words never spend a
     Gemini call; Gemini runs in parallel, DynamoDB and Mochi writes stay
     sequential. None means the word failed.
+
+    One deadline covers the whole list: words Gemini could not finish in time
+    come back as None, and the words that did finish are still answered.
     """
+    deadline = gemini_deadline()
     results: dict[str, AddCardResult | None] = {}
     to_generate: list[str] = []
 
@@ -807,7 +900,7 @@ def add_ai_cards(
 
     if to_generate:
         with ThreadPoolExecutor(max_workers=min(BULK_AI_MAX_WORKERS, len(to_generate))) as pool:
-            cards = list(pool.map(lambda word: generate_card_or_none(word, config), to_generate))
+            cards = list(pool.map(lambda word: generate_card_or_none(word, config, deadline=deadline), to_generate))
 
         for word, card in zip(to_generate, cards):
             if card is None:
@@ -1436,6 +1529,31 @@ def clear_session(telegram_user_id: str) -> None:
     get_sessions_table().delete_item(Key={"telegram_user_id": str(telegram_user_id)})
 
 
+def claim_telegram_update(update_id: int) -> bool:
+    """
+    False when this update was already taken by an earlier invocation.
+
+    Telegram re-sends an update when the webhook times out; without this every
+    retry would run Gemini again for the whole list and burn the quota. The
+    record shares the sessions table under an "update#" key (user ids are
+    numeric, so no clash) and expires through the same TTL attribute.
+    """
+    try:
+        get_sessions_table().put_item(
+            Item={
+                "telegram_user_id": f"{TELEGRAM_UPDATE_KEY_PREFIX}{update_id}",
+                "expires_at": int(time.time()) + TELEGRAM_UPDATE_DEDUP_TTL_SECONDS,
+            },
+            ConditionExpression="attribute_not_exists(telegram_user_id)",
+        )
+    except ClientError as error:
+        if error.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            return False
+        # DynamoDB trouble must not silence the bot: handle the update anyway.
+        log_event("telegram_update_claim_error", error_code=error.response.get("Error", {}).get("Code"))
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Edit sessions
 # ---------------------------------------------------------------------------
@@ -1608,6 +1726,11 @@ def handle_telegram_webhook(event: dict[str, Any]) -> dict[str, Any]:
     require_secret_header(event, "x-telegram-bot-api-secret-token", config["TELEGRAM_WEBHOOK_SECRET"])
 
     update = parse_json_body(event)
+
+    update_id = update.get("update_id")
+    if isinstance(update_id, int) and not claim_telegram_update(update_id):
+        log_event("telegram_update_duplicate", update_id=update_id)
+        return json_response(200, {"ok": True, "duplicate": True})
 
     callback_query = update.get("callback_query")
     if isinstance(callback_query, dict):

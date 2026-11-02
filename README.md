@@ -38,6 +38,25 @@ Each word in DynamoDB has a `status`:
 
 Gemini also estimates `frequency` (`common` / `moderate` / `rare`) and a CEFR `level`. Both are shown in Telegram and added as Mochi tags (`freq-common`, `b2`).
 
+## Gemini Models and Time Budget
+
+`GEMINI_MODEL` in the app-config secret is one model or a comma-separated chain, tried in order:
+
+```text
+gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemini-3.5-flash
+```
+
+- On `503` (overloaded), `429` (quota), a timeout or broken JSON the next model is tried. `400` / `401` / `403` stop the chain: another model will not fix them.
+- A model that returned `503` / `429` / timed out is skipped for 2 minutes, so the rest of a word list goes straight to the next model.
+- One attempt waits up to 8s; all Gemini calls of one request share an 18s deadline (Lambda timeout is 30s). Words that did not finish in time get `❌ word — failed, try again`, the finished ones are still answered.
+- Logs: `gemini_model_used` (model, attempt), `gemini_model_skipped` (reason `cooldown` / `deadline`), `gemini_request_error` (model, code).
+
+The chain can be changed in Secrets Manager without a deploy.
+
+## Telegram Retries
+
+Telegram re-sends an update until the webhook answers `200`. Each `update_id` is claimed in the sessions table (`update#<id>`, 24h TTL) before processing, so a retry is answered `200` without running Gemini again.
+
 Sighting counter: adding a word again while it is a draft or in the inbox increments `seen_count` instead of replying "exists". From 3 sightings the reply suggests sending the word to Mochi.
 
 Getting words out of the inbox:

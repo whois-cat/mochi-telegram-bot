@@ -73,7 +73,7 @@ class AddAiCardsTests(unittest.TestCase):
     def test_existing_words_skip_gemini_and_failures_do_not_stop_the_list(self):
         existing = make_item("reliable", main.STATUS_INBOX)
 
-        def fake_generate(word, config):
+        def fake_generate(word, config, *, deadline):
             if word == "broken":
                 raise main.AiGenerationError("boom")
             return make_card(word)
